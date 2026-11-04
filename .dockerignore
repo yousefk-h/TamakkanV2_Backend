@@ -1,0 +1,35 @@
+# Only app/ is ever COPYed into the image (see Dockerfile), but keeping the
+# build context small matters too - Docker sends everything not excluded
+# here to the daemon before the build even starts.
+
+.venv/
+.tamakkan/
+*.eml
+__pycache__/
+*.pyc
+.pytest_cache/
+
+.git/
+.github/
+
+# Separate deployable - has its own requirements.txt/settings, never bundled
+# into this image (see Dockerfile's top comment).
+livekit_agent/
+
+tests/
+requirements-dev.txt
+pytest.ini
+
+.env
+.env.*
+!.env.example
+
+.claude/
+.agents/
+skills/
+skills-lock.json
+.mcp.json
+
+*.md
+*.pdf
+*.csv

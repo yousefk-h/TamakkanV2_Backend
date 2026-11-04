@@ -1,0 +1,239 @@
+"""A lesson topic: the merged content model from the platform plan (§4.1) -
+covers both the lesson catalogue and the richer authored content (warm-up
+questions, phrase groups, themed vocabulary, etc.) that the real `.docx`
+lesson files actually contain.
+
+Lesson videos are embedded directly from YouTube at launch - no download, no
+re-hosting - so there is no media/hosting state here, only the transcript
+pipeline's state (captions or the Gemini fallback, see the platform plan §6).
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import Annotated, Optional
+
+from beanie import Indexed
+from pydantic import BaseModel, Field
+
+from app.models.base import BaseDocument
+
+
+class Level(str, Enum):
+    BEGINNER = "beginner"
+    INTERMEDIATE = "intermediate"
+    ADVANCED = "advanced"
+
+
+class VoicePromptMode(str, Enum):
+    SHARED = "shared"  # one prompt (`avatar_prompt`) for Avatar and Voice Practice
+    SEPARATE = "separate"  # Voice Practice uses `voice_prompt`
+
+
+class ArabicInterventionLevel(str, Enum):
+    """How often/deeply the teacher wants the optional Jordanian-Arabic
+    clarification support (see `TopicContent.arabic_support_enabled`) to kick
+    in - only consulted by both agents when that flag is on. Jordanian
+    (Ammani-dialect) Arabic specifically, never Egyptian dialect or heavy
+    Modern Standard Arabic - see each agent's own prompt module."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class TranscriptState(str, Enum):
+    QUEUED = "queued"
+    EXTRACTING = "extracting"
+    PENDING_REVIEW = "pending_review"
+    APPROVED_FOR_AI = "approved_for_ai"
+
+
+class TranscriptSource(str, Enum):
+    """Which path `TranscriptPipelineService._fetch_transcript` actually took
+    - lets the reviewing admin see whether `raw_transcript` is a real YouTube
+    caption track or Gemini transcribing the video's audio (the fallback
+    when no captions exist). An AI-generated transcript can contain
+    mishearings a real caption track wouldn't, so it's worth flagging before
+    an admin approves it as-is.
+    """
+
+    CAPTIONS = "captions"
+    AI_GENERATED = "ai_generated"
+
+
+TRANSCRIPT_TRANSITIONS: dict[TranscriptState, set[TranscriptState]] = {
+    TranscriptState.QUEUED: {TranscriptState.EXTRACTING},
+    TranscriptState.EXTRACTING: {TranscriptState.PENDING_REVIEW, TranscriptState.QUEUED},
+    TranscriptState.PENDING_REVIEW: {TranscriptState.APPROVED_FOR_AI, TranscriptState.EXTRACTING},
+    TranscriptState.APPROVED_FOR_AI: set(),  # terminal
+}
+
+
+class TranscriptSegment(BaseModel):
+    text: str
+    start: float
+    duration: float
+
+
+class UsefulPhraseGroup(BaseModel):
+    function: str  # "Starting your speech", "Giving opinions", "Concluding", ...
+    phrases: list[str]
+
+
+class VocabularyItem(BaseModel):
+    term: str
+    theme: str  # "Travel", "Culture", "Describing Experiences", ...
+    example_sentence: str
+    # Optional: the platform's content is English-only otherwise (see the
+    # localization work's own scope note), but a bare English vocabulary list
+    # is far less useful to a student still building their English - this one
+    # field is content translation, not full localization.
+    arabic_meaning: str = ""
+
+
+class GuidedQuestionPart(BaseModel):
+    part_title: str  # "Part 1: Introduction", ...
+    questions: list[str]
+
+
+class SentenceStarterBlock(BaseModel):
+    stage: str  # "Introduction", "Describe your favorite artist", ...
+    starters: list[str]
+    worked_example: str
+
+
+class PracticeScheduleBlock(BaseModel):
+    duration_minutes: int
+    activity: str  # "Listening practice", "Shadowing", "Vocabulary notes", "Record yourself"
+
+
+class TopicContent(BaseDocument):
+    title: str
+    level: Level
+    youtube_urls: list[str] = Field(default_factory=list)
+    # Set only via `POST/DELETE /topics/{id}/thumbnail` (an uploaded Cloudinary
+    # asset), never accepted as a raw URL on `TopicCreate`/`TopicUpdate` - that
+    # would let an admin point a lesson's thumbnail at an arbitrary origin
+    # rather than something this server actually hosts. `None` means "use the
+    # thumbnail derived from `youtube_urls[0]`" - see `app.core.youtube
+    # .derive_thumbnail_url` and `TopicPublic.from_topic`.
+    custom_thumbnail_url: Optional[str] = None
+    custom_thumbnail_public_id: Optional[str] = None
+    # Best-effort, fetched from the YouTube Data API when `youtube_urls`
+    # changes (see `app.core.youtube.fetch_video_duration_seconds`) - `None`
+    # if there's no video, no API key configured, or the lookup failed.
+    # Purely informational (a "video length" badge); nothing enforces it.
+    video_duration_seconds: Optional[int] = None
+
+    # Video-optional lesson source (card #16): an uploaded PDF document a
+    # teacher can ground a lesson in instead of, or alongside, a video. Same
+    # upload shape as the thumbnail above (url + Cloudinary public id), plus
+    # the plain-text extracted from it at upload time - see
+    # `app.core.pdf_extraction`. `pdf_extracted_text` (not `youtube_urls`) is
+    # what `TranscriptPipelineService` actually reads as source material.
+    pdf_url: Optional[str] = None
+    pdf_public_id: Optional[str] = None
+    pdf_filename: Optional[str] = None
+    pdf_extracted_text: Optional[str] = None
+
+    # Topic organization by unit + order (card #17). `unit_id` is `None` for
+    # a legacy/unassigned topic - the UI groups those under an "Unassigned"
+    # bucket per level rather than hiding them. `order_index` breaks ties
+    # within that grouping; equal values (every pre-existing topic defaults
+    # to 0) fall back to `created_at` for a still-deterministic order - see
+    # `TopicContentRepository._paged`.
+    unit_id: Annotated[Optional[str], Indexed()] = None
+    order_index: int = 0
+
+    warm_up_questions: list[str] = Field(default_factory=list)
+    guided_questions: list[GuidedQuestionPart] = Field(default_factory=list)
+    useful_phrases: list[UsefulPhraseGroup] = Field(default_factory=list)
+    vocabulary: list[VocabularyItem] = Field(default_factory=list)
+    sentence_starters: list[SentenceStarterBlock] = Field(default_factory=list)
+    suggested_practice_schedule: list[PracticeScheduleBlock] = Field(default_factory=list)
+
+    transcript_state: TranscriptState = TranscriptState.QUEUED
+    # When the current `extracting` run claimed this topic. `extracting` is the
+    # only state entered by a background task, so it's the only one that can be
+    # left behind by a process that died mid-run - and the transition table has
+    # no `extracting -> extracting` edge, which would otherwise make a stranded
+    # topic permanently un-regenerable. This timestamp is what lets
+    # `TranscriptPipelineService` recognise a run as abandoned and reclaim it.
+    # `None` in every other state.
+    transcript_state_started_at: Optional[datetime] = None
+    raw_transcript: list[TranscriptSegment] = Field(default_factory=list)
+    # Set alongside `raw_transcript` when a run completes - `None` until the
+    # first one does. See `TranscriptSource`.
+    transcript_source: Optional[TranscriptSource] = None
+    approved_transcript: Optional[str] = None
+
+    avatar_prompt: str = ""
+    opening_line: str = ""
+    # Voice Practice (the hosted voice-only agent) reuses `avatar_prompt`
+    # unless the teacher explicitly chose separate prompts - see
+    # `voice_practice_prompt`. The choice is stored on its own so a leftover
+    # `voice_prompt` from an earlier "separate" edit never silently wins after
+    # the teacher switches back to "shared". Old lessons default to shared.
+    voice_prompt_mode: VoicePromptMode = VoicePromptMode.SHARED
+    voice_prompt: str = ""
+
+    # Optional, teacher-controlled Jordanian-Arabic clarification support
+    # (English stays the primary practice language either way) - threaded
+    # into both agents' job-dispatch metadata by `LiveSessionService
+    # .start_session` and turned into an extra, additive instruction block by
+    # each agent's own prompt module when it's on.
+    #
+    # Deliberately `Optional[bool]`, not a plain `bool = False`, to keep
+    # three distinct states apart:
+    # - `None`: every topic that predates this field (legacy content) -
+    #   absent from the stored document, so Beanie fills in this default on
+    #   load. The Voice Practice agent treats this the same as its old,
+    #   unconditional "you may briefly explain in Arabic if requested" line,
+    #   so a pre-existing lesson's behavior there is unchanged byte-for-byte.
+    #   The Avatar agent never had any Arabic behavior at all, so for it this
+    #   is identical to `False` (no Arabic block added).
+    # - `False`: a teacher explicitly turned this off - no Arabic, full stop,
+    #   on either agent (overrides the Voice agent's old default-on line).
+    # - `True`: the teacher explicitly turned it on, at `arabic_intervention_
+    #   level` below.
+    arabic_support_enabled: Optional[bool] = None
+    arabic_intervention_level: ArabicInterventionLevel = ArabicInterventionLevel.LOW
+
+    # Which Administrator authored this topic - teacher isolation. `None` on
+    # every topic that predates this field (legacy content): visible to every
+    # Administrator but editable by none until Root explicitly re-owns it -
+    # see `TopicContentService.get_own_topic`.
+    #
+    # A plain indexed id, not a `Link[User]` - same reasoning as
+    # `User.created_by_id`: a Link can't be queried by equality, and its
+    # `fetch()` returns the Link itself rather than `None` for a dangling
+    # target.
+    created_by_id: Annotated[Optional[str], Indexed()] = None
+
+    @property
+    def voice_practice_prompt(self) -> str:
+        """The prompt the Voice Practice agent receives. Falls back to
+        `avatar_prompt` whenever a separate voice prompt isn't selected (or
+        was selected but left blank)."""
+        if self.voice_prompt_mode == VoicePromptMode.SEPARATE and self.voice_prompt.strip():
+            return self.voice_prompt
+        return self.avatar_prompt
+
+    class Settings:
+        name = "topic_contents"
+        # Every query in `TopicContentRepository` filters `is_deleted` and sorts
+        # newest-first, then narrows by either `transcript_state` (the teacher
+        # review queue, which clients poll) or `level` (a Standard student's
+        # entitlement). Without these both were collection scans - and a scan
+        # here is unusually expensive because each document carries its whole
+        # transcript, so it reads tens of MB to return a handful of rows.
+        # Pro entitlement queries by `_id: {$in: [...]}`, already indexed.
+        indexes = [
+            [("is_deleted", 1), ("transcript_state", 1), ("created_at", -1)],
+            [("is_deleted", 1), ("level", 1), ("created_at", -1)],
+            # An Administrator's own "My Topics" list (teacher isolation).
+            [("is_deleted", 1), ("created_by_id", 1), ("created_at", -1)],
+            # Deterministic unit/order display (card #17) - see
+            # `TopicContentRepository._paged`.
+            [("is_deleted", 1), ("unit_id", 1), ("order_index", 1), ("created_at", 1)],
+        ]

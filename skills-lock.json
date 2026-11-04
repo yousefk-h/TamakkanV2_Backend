@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "skills": {
+    "architecture-designer": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/architecture-designer/SKILL.md",
+      "computedHash": "44c08f1267adfc141750f7735c13efd281c40fa1e690fe6bc7d6e494a74d4a42"
+    },
+    "cloudinary-docs": {
+      "source": "cloudinary-devs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloudinary-docs/SKILL.md",
+      "computedHash": "7dc9abb55191801b0699b86620e48d3cc6dd2218c25c9d914fb19e37be3fdec8"
+    },
+    "fastapi": {
+      "source": "fastapi/fastapi",
+      "sourceType": "github",
+      "skillPath": "fastapi/.agents/skills/fastapi/SKILL.md",
+      "computedHash": "187b2e06c41cdb6c6beeab15e6db4aeb1bf62f57735974646ad5646af8aacc66"
+    },
+    "fastapi-expert": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/fastapi-expert/SKILL.md",
+      "computedHash": "01b185dd062c1d9fd3d0f9e18151a46c84797505bcd4093af77ff4b0179d7bb4"
+    },
+    "gemini-live-api-dev": {
+      "source": "google-gemini/gemini-skills",
+      "sourceType": "github",
+      "skillPath": "skills/gemini-live-api-dev/SKILL.md",
+      "computedHash": "eec39a301d1116a8b1bf3fea8e9998e0d1932dd413cfbc5a4705bbb288e25243"
+    },
+    "karpathy-guidelines": {
+      "source": "multica-ai/andrej-karpathy-skills",
+      "sourceType": "github",
+      "skillPath": "skills/karpathy-guidelines/SKILL.md",
+      "computedHash": "0ec1641120accbb458780e0bd19a50a4182f2b97863e90851b91307f29802c9f"
+    },
+    "livekit-agents": {
+      "source": "livekit/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/livekit-agents/SKILL.md",
+      "computedHash": "d709ee665f549428810436f97309bfcee237f5ce7801f4c0eecaf6445085f48a"
+    },
+    "prompt-engineer": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/prompt-engineer/SKILL.md",
+      "computedHash": "cc89b3fefde2ff191e2d0ca2fa23e1034b783338c44dad19a617f572317913b2"
+    },
+    "python-pro": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/python-pro/SKILL.md",
+      "computedHash": "bfd83668264345dfa519e5d8f339c64ac7d2b883748d85a26015781e9338fcc9"
+    },
+    "secure-code-guardian": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/secure-code-guardian/SKILL.md",
+      "computedHash": "f140b4582963766a374047e417792459f19f7964dd7aa5b76c5ca3cadcd6fdf9"
+    },
+    "security-reviewer": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/security-reviewer/SKILL.md",
+      "computedHash": "cca56045dd49c756546d74d46034c91be2159875e358050d40c7d1905700e8fd"
+    }
+  }
+}

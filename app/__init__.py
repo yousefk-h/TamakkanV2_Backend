@@ -1,0 +1,1 @@
+"""Tamakkan backend application package."""

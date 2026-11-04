@@ -1,0 +1,59 @@
+"""Response shape for `GET /me/progress` - a student's streak, badges, and
+30-day challenge position. Nothing here is persisted: every field is computed
+fresh from `LiveSession`/`RecordingSubmission`/`TopicContent` on each request
+by `ProgressService`, the same "derive, don't store" choice already made for
+`LiveSessionPublic.report` (computed once at session-end and stored there,
+whereas this recomputes every time since streak/badge state depends on *all*
+history, not one document).
+"""
+
+from datetime import date, datetime
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel
+
+
+class BadgeKey(str, Enum):
+    STREAK = "streak"
+    VOCAB_MASTER = "vocab_master"
+    FIRST_CLASS = "first_class"
+    TOP_SCORER = "top_scorer"
+    FAST_IMPROVER = "fast_improver"
+    LEVEL_COMPLETE = "level_complete"
+
+
+class Badge(BaseModel):
+    key: BadgeKey
+    earned: bool
+    # When the badge's condition was first met - `None` while `earned` is
+    # False. Copy (icon/title/desc) is a frontend i18n concern, keyed by
+    # `key`, not carried here.
+    earned_at: Optional[datetime] = None
+
+
+class ChallengeMilestone(BaseModel):
+    day: int
+    reached: bool
+
+
+class StudentProgress(BaseModel):
+    current_streak: int
+    longest_streak: int
+    total_active_days: int
+    # 1-based, capped to the challenge length, `0` if the program hasn't
+    # started yet - see `ProgressService` for how day 1 is anchored to
+    # `program_start_date`, the date the assigning admin chose.
+    challenge_day: int
+    challenge_total_days: int
+    # The date `challenge_day` counts from - `None` if no plan has ever been
+    # assigned. Lets the frontend show "starts {date}" when `challenge_day`
+    # is `0` instead of a confusing "Day 0."
+    program_start_date: Optional[date] = None
+    # Oldest to newest, always exactly 7 entries, the 7th being today - the
+    # weekly dot tracker's data, not a display-ready label set (the frontend
+    # already owns day-of-week formatting via the locale).
+    last_7_days_active: list[bool]
+    last_7_days_dates: list[date]
+    badges: list[Badge]
+    milestones: list[ChallengeMilestone]

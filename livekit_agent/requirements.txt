@@ -1,0 +1,27 @@
+# The "Discuss with Mariam" worker's own, complete dependency list. This
+# package is a separate deployable from the main API server (see agent.py's
+# module docstring) - it does not rely on the main backend's requirements.txt
+# or virtualenv, and doesn't import anything from `app.*`.
+#
+# Install into this package's OWN virtualenv, from the backend repository root:
+#   python -m venv livekit_agent/.venv
+#   livekit_agent/.venv/Scripts/pip install -r livekit_agent/requirements.txt
+#
+# OpenAI's Realtime API is the primary conversation model, with Ultravox as
+# a fallback via `livekit.agents.llm.RealtimeModelFallbackAdapter` (see
+# agent.py). Gemini Live was tried first and fully removed - see this
+# package's README for why.
+livekit-agents[openai]==1.7.1
+livekit-plugins-ultravox==1.7.1
+# SpatialReal avatar plugin. 1.8.4+ runs on the NEW SpatialReal platform (api.spatialreal.com / `spatialreal` Python SDK);
+# 1.8.3 and earlier use the legacy AvatarKit / spatialwalk.cloud endpoints. It only requires livekit-agents>=1.6.6, so the
+# rest of the LiveKit stack stays on 1.7.1.
+livekit-plugins-spatialreal==1.8.4
+# Inbound Voice Isolation (Krisp VIVA, level 90) - see `_avatar_room_options` in agent.py. The plugin is versioned
+# independently of the other LiveKit plugins (0.x). 0.3.1 is the newest release that works with livekit-agents 1.7.1
+# (0.4.x needs >=1.8.0). It pulls in livekit-plugins-krisp-internal (the native code + bundled model).
+livekit-plugins-krisp==0.3.1
+
+httpx==0.28.1
+pydantic-settings==2.15.0
+python-dotenv==1.2.2

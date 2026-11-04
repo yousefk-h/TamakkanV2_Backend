@@ -1,0 +1,54 @@
+# Runs the FastAPI backend only (see Dockerfile's top comment for why
+# `livekit_agent/` isn't part of this image/compose file). No nginx service
+# here - the host's own system nginx (fronting other sites on this VPS
+# already) is the reverse proxy; see nginx/system-site.conf.example for the
+# site config it needs.
+#
+# No MongoDB service here on purpose: `MONGODB_URI` in `.env` already points
+# at a real, already-running MongoDB (see `.env` / `.env.example`) - this
+# compose file doesn't stand up its own database.
+#
+# `api` publishes its port to 127.0.0.1 only - reachable from the host's own
+# nginx, not directly from outside.
+#
+# Identity (fixed, Tamakkan-only - never a legacy/shared name):
+#   compose project  tamakkan-backend
+#   container        tamakkan-backend-api
+#   image            tamakkan-backend:<commit-sha>
+# The image is tagged with the exact commit it was built from. TAMAKKAN_IMAGE_TAG
+# is required - there is deliberately no fallback tag and no `latest`.
+# The project and container names are written out here (not derived from a
+# variable or the directory name), so a deploy can never recreate the old
+# legacy shared-name identity that predates this naming.
+#
+# Host port: TAMAKKAN_API_HOST_PORT (default 4652, always bound to 127.0.0.1).
+# Only override it for a temporary side-by-side container; production is 4652.
+# The port inside the container stays 4652.
+#
+# Deploying: .github/workflows/deploy.yml -> deploy/tamakkan-deploy.sh.
+# By hand (from this directory):
+#   cp .env.example .env   # fill in real values - see that file's comments
+#   TAMAKKAN_IMAGE_TAG="$(git rev-parse HEAD)" docker compose build
+#   TAMAKKAN_IMAGE_TAG="$(git rev-parse HEAD)" docker compose up -d --no-build
+#   docker compose logs -f
+
+name: tamakkan-backend
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tamakkan-backend:${TAMAKKAN_IMAGE_TAG:?set TAMAKKAN_IMAGE_TAG to the commit SHA being deployed}
+    container_name: tamakkan-backend-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${TAMAKKAN_API_HOST_PORT:-4652}:4652"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4652/api/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

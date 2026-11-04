@@ -1,0 +1,25 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+pydantic[email]==2.13.4
+pydantic-settings==2.15.0
+
+beanie==2.2.0
+pymongo==4.17.0
+
+python-jose[cryptography]==3.5.0
+bcrypt==5.0.0
+python-multipart==0.0.32
+cloudinary==1.45.0
+pypdf==6.20.1
+loguru==0.7.3
+httpx==0.28.1
+google-genai==2.17.0
+pydantic-ai-slim[google]==2.31.0
+livekit-api==1.2.0
+
+# Deliberately not here yet - this is the plain server-side SDK (token
+# minting, room service) used by the FastAPI app itself. The actual live
+# conversation runs in the separate `livekit_agent/` worker process, which
+# has its own requirements.txt (livekit-agents, livekit-plugins-google,
+# livekit-plugins-spatialreal) - no reason to pull the full Agents framework
+# into this API server's dependency set.
