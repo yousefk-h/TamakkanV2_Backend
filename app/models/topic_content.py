@@ -138,6 +138,7 @@ class LessonExercise(BaseModel):
     content: str = ""
     arabic_note: str = ""
     media_url: str = ""
+    audio_url: str = ""
     pairs: list[ExercisePair] = Field(default_factory=list)
     min_words: int = 0
 

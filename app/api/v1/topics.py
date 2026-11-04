@@ -18,10 +18,13 @@ not this.
 """
 
 from typing import Optional
+import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 
 from app.core.security import get_current_user, require_teacher_or_administrator
+from app.core.storage import UploadFailedError, get_image_storage, get_lesson_audio_storage
+from app.core.exceptions import UnprocessableException
 from app.core.transcript_english_review import TranscriptReviewResult
 from app.models.topic_content import TranscriptState
 from app.models.user import Role, User
@@ -53,6 +56,29 @@ from app.services.transcript_review_service import (
 from app.services.exercise_draft_service import DraftExercisesRequest, DraftExercisesResponse, ExerciseDraftService, get_exercise_draft_service
 
 router = APIRouter()
+
+
+@router.post("/topics/{topic_id}/exercise-media")
+async def upload_exercise_media(topic_id: str, file: UploadFile = File(...),
+                                teacher: User = Depends(require_teacher_or_administrator),
+                                service: TopicContentService = Depends(get_topic_content_service)) -> dict[str, str]:
+    """Upload teacher-owned lesson image or listening audio before saving the block."""
+    await service.get_own_topic(topic_id, teacher)
+    mime = file.content_type or ""
+    image = mime in {"image/jpeg", "image/png", "image/webp"}
+    audio = mime in {"audio/mpeg", "audio/mp4", "audio/wav", "audio/webm", "audio/ogg"}
+    if not image and not audio:
+        raise UnprocessableException("Use a JPEG, PNG, WebP, MP3, M4A, WAV, WebM or OGG file")
+    max_bytes = (5 if image else 15) * 1024 * 1024
+    data = await file.read(max_bytes + 1)
+    if not data or len(data) > max_bytes:
+        raise UnprocessableException("File is empty or larger than the lesson media limit")
+    public_id = f"Tamakkan/lesson-{('images' if image else 'audio')}/{topic_id}-{uuid.uuid4().hex}"
+    try:
+        result = await (get_image_storage() if image else get_lesson_audio_storage()).upload(data, public_id)
+    except UploadFailedError as exc:
+        raise UnprocessableException(f"Could not upload lesson media: {exc}") from exc
+    return {"url": result.secure_url, "kind": "image" if image else "audio"}
 
 
 @router.post("/topics", response_model=TopicPublic)

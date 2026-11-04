@@ -201,6 +201,23 @@ def get_image_storage() -> ImageStorage:
     return CloudinaryImageStorage()
 
 
+class CloudinaryLessonAudioStorage:
+    """Public teacher-authored listening audio, separate from private student recordings."""
+
+    async def upload(self, file_bytes: bytes, public_id: str) -> ImageUploadResult:
+        _ensure_configured()
+        try:
+            result = await run_in_threadpool(cloudinary.uploader.upload, file_bytes,
+                                             public_id=public_id, resource_type="video", type="upload")
+            return ImageUploadResult(public_id=result["public_id"], secure_url=result["secure_url"])
+        except Exception as exc:
+            raise UploadFailedError(str(exc)) from exc
+
+
+def get_lesson_audio_storage() -> CloudinaryLessonAudioStorage:
+    return CloudinaryLessonAudioStorage()
+
+
 # Lesson source PDFs (video-optional content, card #16). Same visibility
 # reasoning as the thumbnail above - teacher-authored source material, not
 # sensitive student data - so delivery is the same plain public `upload`

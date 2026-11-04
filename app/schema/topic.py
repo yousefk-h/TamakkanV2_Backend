@@ -138,6 +138,7 @@ class LessonExerciseIn(LessonExercise):
     content: Annotated[str, Field(max_length=5000)] = ""
     arabic_note: Annotated[str, Field(max_length=1000)] = ""
     media_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
+    audio_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
     pairs: Annotated[list[ExercisePairIn], Field(max_length=8)] = Field(default_factory=list)
     min_words: Annotated[int, Field(ge=0, le=500)] = 0
 
@@ -157,6 +158,8 @@ class LessonExerciseIn(LessonExercise):
             raise ValueError("This exercise needs source text or an instruction")
         if self.kind == ExerciseKind.IMAGE_COMPLETION and not self.media_url.startswith(("https://", "http://")):
             raise ValueError("Image completion needs an http(s) image URL")
+        if self.audio_url and (self.kind != ExerciseKind.LISTENING or not self.audio_url.startswith(("https://", "http://"))):
+            raise ValueError("Only listening exercises accept an http(s) audio URL")
         if self.kind == ExerciseKind.GAME and (len(self.pairs) < 2 or any(not pair.left.strip() or not pair.right.strip() for pair in self.pairs)):
             raise ValueError("A matching game needs at least two complete pairs")
         return self
