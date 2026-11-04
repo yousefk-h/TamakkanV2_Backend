@@ -194,7 +194,7 @@ class LiveSessionService:
                 "topic_id": topic.id,
                 "max_duration_minutes": max_duration_minutes,
                 "lesson_title": topic.title,
-                "lesson_prompt": topic.voice_practice_prompt,
+                "lesson_prompt": topic.voice_practice_prompt + (f"\n\nCenter level guidance ({topic.level_name}): {topic.level_guidance}" if topic.level_guidance else ""),
                 "opening_line": topic.opening_line,
                 "level": topic.level.value,
                 # Optional Jordanian-Arabic clarification support (teacher-
@@ -221,7 +221,7 @@ class LiveSessionService:
                 # Handed to the agent directly so it never needs its own
                 # database read to build Mariam's instructions or opening
                 # line - see this module's docstring.
-                "topic_instructions": topic.avatar_prompt,
+                "topic_instructions": topic.avatar_prompt + (f"\n\nCenter level guidance ({topic.level_name}): {topic.level_guidance}" if topic.level_guidance else ""),
                 "opening_line": topic.opening_line,
                 "level": topic.level.value,
                 # Same optional Jordanian-Arabic support as Voice Practice

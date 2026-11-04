@@ -14,6 +14,8 @@ from app.api.v1.calendar_templates import router as calendar_templates_router
 from app.api.v1.exercise_attempts import router as exercise_attempts_router
 from app.api.v1.classes import router as classes_router
 from app.api.v1.health import router as health_router
+from app.api.v1.homework import router as homework_router
+from app.api.v1.level_profiles import router as level_profiles_router
 from app.api.v1.me import router as me_router
 from app.api.v1.operations import router as operations_router
 from app.api.v1.root import router as root_router
@@ -39,6 +41,8 @@ api_router.include_router(topics_router, prefix="/v1", tags=["Topics"])
 api_router.include_router(units_router, prefix="/v1", tags=["Units"])
 api_router.include_router(submissions_router, prefix="/v1", tags=["Submissions"])
 api_router.include_router(exercise_attempts_router, prefix="/v1", tags=["Exercise Answers"])
+api_router.include_router(homework_router, prefix="/v1", tags=["Homework"])
+api_router.include_router(level_profiles_router, prefix="/v1", tags=["Level Profiles"])
 api_router.include_router(classes_router, prefix="/v1", tags=["Classes"])
 api_router.include_router(sessions_router, prefix="/v1", tags=["Sessions"])
 api_router.include_router(calendar_templates_router, prefix="/v1", tags=["Calendar Templates"])

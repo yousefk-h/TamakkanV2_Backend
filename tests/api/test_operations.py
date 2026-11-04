@@ -32,10 +32,11 @@ def clock(monkeypatch):
     monkeypatch.setattr("app.api.v1.operations.utcnow", lambda: NOW)
 
 
-async def test_operations_counts_real_states_and_scopes_teacher_roster(client):
+async def test_operations_is_internal_root_only_and_counts_all_students(client):
     teacher = await user("teacher@example.com", Role.TEACHER)
     other = await user("other@example.com", Role.TEACHER)
     admin = await user("admin@example.com", Role.ADMINISTRATOR)
+    root = await user("root@example.com", Role.ROOT)
     student = await user("student@example.com", Role.STUDENT, created_by_id=teacher.id)
     outsider = await user("outsider@example.com", Role.STUDENT, created_by_id=other.id)
     await session(student)
@@ -47,15 +48,15 @@ async def test_operations_counts_real_states_and_scopes_teacher_roster(client):
     await session(student, is_deleted=True)
     await session(outsider)
 
-    response = client.get("/api/v1/operations/sessions", headers=headers(teacher))
+    response = client.get("/api/v1/operations/sessions", headers=headers(root))
     assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "no-store"
     body = response.json()
-    assert body["connected_by_mode"] == {"topic_discussion": 1, "voice_practice": 1}
+    assert body["connected_by_mode"] == {"topic_discussion": 2, "voice_practice": 1}
     assert (body["connecting"], body["connection_failures_24h"], body["ended_24h"], body["handoffs_24h"]) == (1, 1, 1, 1)
-    assert len(body["recent_sessions"]) == 6
+    assert len(body["recent_sessions"]) == 7
     assert all("transcript" not in row and "student_id" not in row for row in body["recent_sessions"])
-    center = client.get("/api/v1/operations/sessions", headers=headers(admin)).json()
-    assert center["connected_by_mode"]["topic_discussion"] == 2
+    assert client.get("/api/v1/operations/sessions", headers=headers(teacher)).status_code == 403
+    assert client.get("/api/v1/operations/sessions", headers=headers(admin)).status_code == 403
     assert client.get("/api/v1/operations/sessions", headers=headers(student)).status_code == 403
     assert client.get("/api/v1/operations/sessions").status_code in (401, 403)

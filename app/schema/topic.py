@@ -171,6 +171,7 @@ LessonExerciseList = Annotated[list[LessonExerciseIn], Field(max_length=MAX_LIST
 class TopicCreate(BaseModel):
     title: Title
     level: Level
+    level_profile_id: Optional[str] = None
     youtube_urls: YouTubeUrlList = Field(default_factory=list)
     # Topic organization by unit + order (card #17). `unit_id` is validated
     # against the authenticated admin's own (or legacy/shared) units by
@@ -203,6 +204,7 @@ class TopicUpdate(BaseModel):
 
     title: Optional[Title] = None
     level: Optional[Level] = None
+    level_profile_id: Optional[str] = None
     youtube_urls: Optional[YouTubeUrlList] = None
     unit_id: Optional[str] = None
     order_index: Optional[int] = None
@@ -269,6 +271,8 @@ class TopicListItem(BaseSchema):
 
     title: str
     level: Level
+    level_profile_id: Optional[str] = None
+    level_name: str = ""
     youtube_urls: list[str]
     thumbnail_url: Optional[str] = None
     # Best-effort, from the YouTube Data API - `None` if there's no video,
@@ -313,6 +317,9 @@ class TopicPublic(BaseSchema):
 
     title: str
     level: Level
+    level_profile_id: Optional[str]
+    level_name: str
+    level_guidance: str
     youtube_urls: list[str]
     thumbnail_url: Optional[str] = None
     # Whether the thumbnail above is a manual upload vs. the free YouTube-
@@ -408,6 +415,9 @@ class TopicPublic(BaseSchema):
             updated_at=topic.updated_at,
             title=topic.title,
             level=topic.level,
+            level_profile_id=topic.level_profile_id,
+            level_name=topic.level_name,
+            level_guidance=topic.level_guidance,
             youtube_urls=topic.youtube_urls,
             thumbnail_url=resolve_thumbnail_url(topic),
             has_custom_thumbnail=bool(topic.custom_thumbnail_url),

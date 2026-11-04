@@ -4,9 +4,9 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Response
 
-from app.core.security import require_teacher_or_administrator
+from app.core.security import require_root
 from app.models.live_session import LiveSession, PracticeMode, SessionState
-from app.models.user import Role, User
+from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.schema.operations import OperationsSession, OperationsSnapshot
 from app.utils.time import utcnow
@@ -15,12 +15,11 @@ router = APIRouter()
 
 
 @router.get("/operations/sessions", response_model=OperationsSnapshot)
-async def session_operations(response: Response, caller: User = Depends(require_teacher_or_administrator)) -> OperationsSnapshot:
+async def session_operations(response: Response, _caller: User = Depends(require_root)) -> OperationsSnapshot:
     """Database-observed state, not a LiveKit room heartbeat or a provider billing estimate."""
     response.headers["Cache-Control"] = "no-store"
     users = UserRepository()
-    roster = (await users.get_all_students() if caller.role == Role.ADMINISTRATOR
-              else await users.get_students_created_by(caller.id))
+    roster = await users.get_all_students()
     now = utcnow()
     if not roster:
         return OperationsSnapshot(generated_at=now, connected_by_mode={mode: 0 for mode in PracticeMode},

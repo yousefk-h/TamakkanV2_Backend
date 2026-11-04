@@ -124,6 +124,8 @@ async def list_topics(
             updated_at=t.updated_at,
             title=t.title,
             level=t.level,
+            level_profile_id=t.level_profile_id,
+            level_name=t.level_name,
             youtube_urls=t.youtube_urls,
             thumbnail_url=resolve_thumbnail_url(t),
             video_duration_seconds=t.video_duration_seconds,

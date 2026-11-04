@@ -959,7 +959,7 @@ async def test_the_topic_list_never_carries_transcripts(client):
 
     assert len(rows) == 1
     assert set(rows[0]) == {
-        "id", "created_at", "updated_at", "title", "level", "youtube_urls", "thumbnail_url",
+            "id", "created_at", "updated_at", "title", "level", "level_profile_id", "level_name", "youtube_urls", "thumbnail_url",
         "video_duration_seconds", "transcript_state", "lesson_status", "session_minutes", "created_by_id",
         "unit_id", "order_index", "has_pdf",
     }

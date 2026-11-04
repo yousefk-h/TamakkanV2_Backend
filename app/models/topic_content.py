@@ -146,6 +146,9 @@ class LessonExercise(BaseModel):
 class TopicContent(BaseDocument):
     title: str
     level: Level
+    level_profile_id: Optional[str] = None
+    level_name: str = ""
+    level_guidance: str = ""
     youtube_urls: list[str] = Field(default_factory=list)
     # Set only via `POST/DELETE /topics/{id}/thumbnail` (an uploaded Cloudinary
     # asset), never accepted as a raw URL on `TopicCreate`/`TopicUpdate` - that

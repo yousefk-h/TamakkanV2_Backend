@@ -18,6 +18,7 @@ from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
 from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage
 from app.core.youtube import fetch_video_duration_seconds
 from app.models.topic_content import TopicContent, TranscriptState
+from app.models.level_profile import LevelProfile
 from app.models.user import Role, User
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, TopicContentRepository
 from app.repositories.unit_repository import UnitRepository
@@ -78,8 +79,14 @@ class TopicContentService:
     async def create(self, body: TopicCreate, created_by: User) -> TopicContent:
         # Ownership always comes from the authenticated Administrator, never
         # from the request body - `TopicCreate` has no field for it at all.
-        unit_id = await self._resolve_unit_id(body.unit_id, body.level, created_by)
-        topic = TopicContent(**{**body.model_dump(), "unit_id": unit_id}, created_by_id=created_by.id)
+        data = body.model_dump()
+        if body.level_profile_id:
+            profile = await LevelProfile.find_one({"_id": body.level_profile_id, "is_deleted": False, "is_active": True})
+            if profile is None:
+                raise UnprocessableException("Selected curriculum level no longer exists")
+            data.update(level=profile.base_level, level_name=profile.name, level_guidance=profile.avatar_guidance)
+        unit_id = await self._resolve_unit_id(body.unit_id, data["level"], created_by)
+        topic = TopicContent(**{**data, "unit_id": unit_id}, created_by_id=created_by.id)
         if topic.youtube_urls:
             topic.video_duration_seconds = await fetch_video_duration_seconds(topic.youtube_urls[0])
         return await self.topic_repository.save(topic)
@@ -230,6 +237,21 @@ class TopicContentService:
         """
         topic = await self.get_own_topic(topic_id, admin)  # 404/403 before writing
         changes = body.model_dump(exclude_unset=True)
+        if "level_profile_id" in changes:
+            profile_id = changes["level_profile_id"]
+            if profile_id:
+                profile = await LevelProfile.find_one(
+                    {"_id": profile_id, "is_deleted": False, "is_active": True}
+                )
+                if profile is None:
+                    raise NotFoundException("Center level not found")
+                changes.update(
+                    level=profile.base_level,
+                    level_name=profile.name,
+                    level_guidance=profile.avatar_guidance,
+                )
+            else:
+                changes.update(level_name="", level_guidance="")
         if "youtube_urls" in changes:
             changes["video_duration_seconds"] = (
                 await fetch_video_duration_seconds(changes["youtube_urls"][0]) if changes["youtube_urls"] else None

@@ -28,6 +28,8 @@ from app.models.alert_log import AlertLog
 from app.models.audit_log import AuditLog
 from app.models.calendar_template import CalendarTemplate
 from app.models.exercise_attempt import ExerciseAttempt
+from app.models.homework import Homework
+from app.models.level_profile import LevelProfile
 from app.models.live_class import LiveClass
 from app.models.live_session import LiveSession
 from app.models.password_reset_request import PasswordResetRequest
@@ -58,6 +60,8 @@ DOCUMENT_MODELS: list = [
     LiveClass,
     CalendarTemplate,
     ExerciseAttempt,
+    Homework,
+    LevelProfile,
 ]
 
 
