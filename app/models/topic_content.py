@@ -107,6 +107,41 @@ class PracticeScheduleBlock(BaseModel):
     activity: str  # "Listening practice", "Shadowing", "Vocabulary notes", "Record yourself"
 
 
+class ExerciseKind(str, Enum):
+    VIDEO = "video"
+    VOCAB = "vocab"
+    IMAGE_COMPLETION = "image_completion"
+    LISTENING = "listening"
+    GRAMMAR = "grammar"
+    READING = "reading"
+    WRITING = "writing"
+    SPEAKING = "speaking"
+    GAME = "game"
+    SERIES = "series"
+    MULTIPLE_CHOICE = "multiple_choice"
+    REFLECTION = "reflection"
+
+
+class ExercisePair(BaseModel):
+    left: str
+    right: str
+
+
+class LessonExercise(BaseModel):
+    """Teacher-authored practice shown in order in the student lesson player."""
+
+    kind: ExerciseKind
+    prompt: str
+    options: list[str] = Field(default_factory=list)
+    correct_option: Optional[int] = None
+    explanation: str = ""
+    content: str = ""
+    arabic_note: str = ""
+    media_url: str = ""
+    pairs: list[ExercisePair] = Field(default_factory=list)
+    min_words: int = 0
+
+
 class TopicContent(BaseDocument):
     title: str
     level: Level
@@ -151,6 +186,7 @@ class TopicContent(BaseDocument):
     vocabulary: list[VocabularyItem] = Field(default_factory=list)
     sentence_starters: list[SentenceStarterBlock] = Field(default_factory=list)
     suggested_practice_schedule: list[PracticeScheduleBlock] = Field(default_factory=list)
+    lesson_exercises: list[LessonExercise] = Field(default_factory=list)
 
     transcript_state: TranscriptState = TranscriptState.QUEUED
     # When the current `extracting` run claimed this topic. `extracting` is the

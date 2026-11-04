@@ -16,6 +16,8 @@ from app.models.user import PlanType, Role, User
 from app.repositories.topic_content_repository import TopicContentRepository
 from app.services.progress_service import get_progress_service
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
+from app.services.exercise_draft_service import ExerciseDraftService, get_exercise_draft_service
+from app.schema.topic import LessonExerciseIn
 from app.services.transcript_pipeline_service import (
     TranscriptPipelineService,
     get_transcript_pipeline_service,
@@ -77,6 +79,102 @@ async def test_administrator_can_create_a_topic(client):
     assert body["title"] == "Talking about Music"
     assert body["level"] == "intermediate"
     assert body["youtube_urls"] == TOPIC_PAYLOAD["youtube_urls"]
+
+
+async def test_teacher_can_author_and_reorder_lesson_exercises(client):
+    token = await _login(client, Role.TEACHER, "exercise-teacher@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    created = client.post("/api/v1/topics", json={"title": "Daily routines", "level": "beginner"}, headers=headers)
+    assert created.status_code == 200
+    topic_id = created.json()["id"]
+    exercises = [
+        {"kind": "multiple_choice", "prompt": "When does she wake up?", "options": ["7 am", "9 am"], "correct_option": 0, "explanation": "The source says seven."},
+        {"kind": "reflection", "prompt": "Describe your morning.", "options": [], "correct_option": None, "explanation": ""},
+    ]
+    updated = client.patch(f"/api/v1/topics/{topic_id}", json={"lesson_exercises": exercises}, headers=headers)
+    assert updated.status_code == 200
+    assert [{key: item[key] for key in authored} for item, authored in zip(updated.json()["lesson_exercises"], exercises)] == exercises
+    fetched = client.get(f"/api/v1/topics/{topic_id}", headers=headers)
+    assert [item["kind"] for item in fetched.json()["lesson_exercises"]] == ["multiple_choice", "reflection"]
+    reordered = client.patch(f"/api/v1/topics/{topic_id}", json={"lesson_exercises": exercises[::-1]}, headers=headers)
+    assert reordered.status_code == 200
+    assert reordered.json()["lesson_exercises"][0]["kind"] == "reflection"
+    from app.utils.time import utcnow
+    teacher_id = client.get("/api/v1/me", headers=headers).json()["id"]
+    student_token = await _login(client, Role.STUDENT, "exercise-student@example.com", plan=PlanType.STANDARD,
+                                 assigned_level=Level.BEGINNER, program_start_date=utcnow(), created_by_id=teacher_id)
+    template = client.post("/api/v1/calendar-templates", json={"name": "Beginner plan", "kind": "standard", "level": "beginner",
+                                                           "days": [{"day": 1, "topic_ids": [topic_id]}]}, headers=headers)
+    assert template.status_code == 200
+    activated = client.post(f"/api/v1/calendar-templates/{template.json()['id']}/activate", headers=headers)
+    assert activated.status_code == 200
+    student_view = client.get(f"/api/v1/topics/{topic_id}", headers={"Authorization": f"Bearer {student_token}"})
+    assert student_view.status_code == 200
+    assert [item["kind"] for item in student_view.json()["lesson_exercises"]] == ["reflection", "multiple_choice"]
+    assert student_view.json()["avatar_prompt"] is None
+
+
+async def test_lesson_exercises_reject_incomplete_answer_keys(client):
+    token = await _login(client, Role.TEACHER, "invalid-exercise@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    response = client.post("/api/v1/topics", json={"title": "Bad quiz", "level": "beginner", "lesson_exercises": [
+        {"kind": "multiple_choice", "prompt": "Choose one", "options": ["A", "B"], "correct_option": 4},
+    ]}, headers=headers)
+    assert response.status_code == 422
+
+
+async def test_teacher_can_save_the_reference_skill_palette_in_order(client):
+    token = await _login(client, Role.TEACHER, "palette-teacher@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    answer = {"options": ["yes", "no"], "correct_option": 0}
+    blocks = [
+        {"kind": "video", "prompt": "Watch the video."},
+        {"kind": "vocab", "prompt": "Learn these words."},
+        {"kind": "image_completion", "prompt": "What is shown?", "media_url": "https://example.com/picture.jpg", **answer},
+        {"kind": "listening", "prompt": "What did you hear?", "content": "I go to school.", **answer},
+        {"kind": "grammar", "prompt": "Choose the correct sentence.", "content": "Use the present simple.", "arabic_note": "المضارع البسيط", **answer},
+        {"kind": "reading", "prompt": "What happened?", "content": "Maya went to school.", **answer},
+        {"kind": "writing", "prompt": "Write about your day.", "min_words": 20},
+        {"kind": "speaking", "prompt": "Describe your routine to Mariam."},
+        {"kind": "game", "prompt": "Match the pairs.", "pairs": [{"left": "hello", "right": "مرحبا"}, {"left": "bye", "right": "وداعا"}]},
+        {"kind": "series", "prompt": "Episode 1", "content": "Maya meets a friend."},
+    ]
+    created = client.post("/api/v1/topics", json={"title": "Full lesson", "level": "beginner", "lesson_exercises": blocks}, headers=headers)
+    assert created.status_code == 200
+    assert [item["kind"] for item in created.json()["lesson_exercises"]] == [item["kind"] for item in blocks]
+    fetched = client.get(f"/api/v1/topics/{created.json()['id']}", headers=headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["lesson_exercises"][8]["pairs"][0] == {"left": "hello", "right": "مرحبا"}
+
+
+async def test_ai_exercise_draft_is_grounded_teacher_scoped_and_not_saved(client):
+    class FakeDrafter:
+        async def draft(self, **kwargs):
+            assert "morning routine" in kwargs["source"]
+            assert kwargs["kind"].value == "reading"
+            assert kwargs["count"] == 1
+            return [LessonExerciseIn(kind="reading", prompt="When does Maya leave?", content="Maya leaves at eight.",
+                                     options=["At eight", "At ten"], correct_option=0)]
+
+    teacher_token = await _login(client, Role.TEACHER, "ai-exercise-teacher@example.com")
+    other_token = await _login(client, Role.TEACHER, "ai-exercise-other@example.com")
+    headers = {"Authorization": f"Bearer {teacher_token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    body = {"kind": "reading", "count": 1}
+    route = f"/api/v1/topics/{topic['id']}/draft-exercises"
+    assert client.post(route, json=body, headers=headers).status_code == 422  # no approved source
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her morning routine. " * 5
+    await stored.save()
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), FakeDrafter())
+    try:
+        assert client.post(route, json=body, headers={"Authorization": f"Bearer {other_token}"}).status_code == 403
+        response = client.post(route, json=body, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+    assert response.status_code == 200
+    assert response.json()["exercises"][0]["prompt"] == "When does Maya leave?"
+    assert client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()["lesson_exercises"] == []
 
 
 async def test_creating_a_topic_rejects_a_playlist_url_instead_of_a_video_url(client):

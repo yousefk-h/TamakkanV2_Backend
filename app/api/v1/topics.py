@@ -50,6 +50,7 @@ from app.services.transcript_review_service import (
     TranscriptReviewService,
     get_transcript_review_service,
 )
+from app.services.exercise_draft_service import DraftExercisesRequest, DraftExercisesResponse, ExerciseDraftService, get_exercise_draft_service
 
 router = APIRouter()
 
@@ -156,6 +157,17 @@ async def update_topic(
     """
     topic = await service.update(topic_id, body, admin)
     return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/draft-exercises", response_model=DraftExercisesResponse)
+async def draft_lesson_exercises(
+    topic_id: str,
+    body: DraftExercisesRequest,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: ExerciseDraftService = Depends(get_exercise_draft_service),
+) -> DraftExercisesResponse:
+    """Generate editable suggestions from approved source text; never saves them."""
+    return await service.draft(topic_id, teacher, body)
 
 
 @router.delete("/topics/{topic_id}", status_code=204)

@@ -22,13 +22,16 @@ prompt text.
 from typing import Annotated, Optional
 from urllib.parse import urlparse
 
-from pydantic import AfterValidator, BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, model_validator
 
 from app.core.youtube import derive_thumbnail_url, extract_video_id
 from app.models.topic_content import (
     ArabicInterventionLevel,
     GuidedQuestionPart,
+    ExerciseKind,
+    ExercisePair,
     Level,
+    LessonExercise,
     PracticeScheduleBlock,
     SentenceStarterBlock,
     TopicContent,
@@ -123,6 +126,45 @@ SentenceStarterList = Annotated[list[SentenceStarterBlock], Field(max_length=MAX
 PracticeScheduleList = Annotated[list[PracticeScheduleBlock], Field(max_length=MAX_LIST_ITEMS)]
 
 
+class ExercisePairIn(ExercisePair):
+    left: Line
+    right: Line
+
+
+class LessonExerciseIn(LessonExercise):
+    prompt: Annotated[str, Field(min_length=1, max_length=MAX_LINE_LENGTH)]
+    options: Annotated[list[Line], Field(max_length=6)] = Field(default_factory=list)
+    explanation: Line = ""
+    content: Annotated[str, Field(max_length=5000)] = ""
+    arabic_note: Annotated[str, Field(max_length=1000)] = ""
+    media_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
+    pairs: Annotated[list[ExercisePairIn], Field(max_length=8)] = Field(default_factory=list)
+    min_words: Annotated[int, Field(ge=0, le=500)] = 0
+
+    @model_validator(mode="after")
+    def valid_answer(self) -> "LessonExerciseIn":
+        if not self.prompt.strip():
+            raise ValueError("Exercise prompt cannot be blank")
+        answer_kinds = {ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.IMAGE_COMPLETION, ExerciseKind.LISTENING, ExerciseKind.GRAMMAR, ExerciseKind.READING}
+        if self.kind in answer_kinds:
+            if len(self.options) < 2 or any(not option.strip() for option in self.options):
+                raise ValueError("Multiple choice exercises need at least two non-empty options")
+            if self.correct_option is None or not 0 <= self.correct_option < len(self.options):
+                raise ValueError("Select a valid correct option")
+        elif self.options or self.correct_option is not None:
+            raise ValueError("This exercise type cannot have answer options")
+        if self.kind in {ExerciseKind.LISTENING, ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.SERIES} and not self.content.strip():
+            raise ValueError("This exercise needs source text or an instruction")
+        if self.kind == ExerciseKind.IMAGE_COMPLETION and not self.media_url.startswith(("https://", "http://")):
+            raise ValueError("Image completion needs an http(s) image URL")
+        if self.kind == ExerciseKind.GAME and (len(self.pairs) < 2 or any(not pair.left.strip() or not pair.right.strip() for pair in self.pairs)):
+            raise ValueError("A matching game needs at least two complete pairs")
+        return self
+
+
+LessonExerciseList = Annotated[list[LessonExerciseIn], Field(max_length=MAX_LIST_ITEMS)]
+
+
 class TopicCreate(BaseModel):
     title: Title
     level: Level
@@ -138,6 +180,7 @@ class TopicCreate(BaseModel):
     vocabulary: VocabularyList = Field(default_factory=list)
     sentence_starters: SentenceStarterList = Field(default_factory=list)
     suggested_practice_schedule: PracticeScheduleList = Field(default_factory=list)
+    lesson_exercises: LessonExerciseList = Field(default_factory=list)
     avatar_prompt: Prompt = ""
     opening_line: Line = ""
     voice_prompt_mode: VoicePromptMode = VoicePromptMode.SHARED
@@ -166,6 +209,7 @@ class TopicUpdate(BaseModel):
     vocabulary: Optional[VocabularyList] = None
     sentence_starters: Optional[SentenceStarterList] = None
     suggested_practice_schedule: Optional[PracticeScheduleList] = None
+    lesson_exercises: Optional[LessonExerciseList] = None
     avatar_prompt: Optional[Prompt] = None
     opening_line: Optional[Line] = None
     voice_prompt_mode: Optional[VoicePromptMode] = None
@@ -280,6 +324,7 @@ class TopicPublic(BaseSchema):
     vocabulary: list[VocabularyItem]
     sentence_starters: list[SentenceStarterBlock]
     suggested_practice_schedule: list[PracticeScheduleBlock]
+    lesson_exercises: list[LessonExercise]
     opening_line: str
     approved_transcript: Optional[str] = None
     # A Student's own lock/done/current/missed status for this lesson - see
@@ -370,6 +415,7 @@ class TopicPublic(BaseSchema):
             vocabulary=topic.vocabulary,
             sentence_starters=topic.sentence_starters,
             suggested_practice_schedule=topic.suggested_practice_schedule,
+            lesson_exercises=topic.lesson_exercises,
             opening_line=topic.opening_line,
             # Unlike `raw_transcript`, this is meant for a Student to read once
             # a teacher has approved it - it's `None` until that happens
