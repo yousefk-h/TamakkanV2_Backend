@@ -415,7 +415,9 @@ class TopicPublic(BaseSchema):
             vocabulary=topic.vocabulary,
             sentence_starters=topic.sentence_starters,
             suggested_practice_schedule=topic.suggested_practice_schedule,
-            lesson_exercises=topic.lesson_exercises,
+            lesson_exercises=topic.lesson_exercises if include_internal else [
+                exercise.model_copy(update={"correct_option": None}) for exercise in topic.lesson_exercises
+            ],
             opening_line=topic.opening_line,
             # Unlike `raw_transcript`, this is meant for a Student to read once
             # a teacher has approved it - it's `None` until that happens

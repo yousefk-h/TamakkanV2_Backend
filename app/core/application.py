@@ -56,6 +56,7 @@ TAGS_METADATA = [
         "description": "Student-submitted audio recordings for a topic, and the views "
         "Students/Administrators use to review them.",
     },
+    {"name": "Exercise Answers", "description": "Persisted student lesson answers and teacher review."},
     {
         "name": "Operations",
         "description": "Internal, roster-scoped snapshots of persisted session states. "
