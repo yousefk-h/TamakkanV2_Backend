@@ -246,6 +246,18 @@ def _get_translate_agent() -> Agent[None, TranslatedTerms]:
 
 
 class GeminiContentDrafter:
+    def __init__(self) -> None:
+        # The pydantic-ai `RunUsage` (input_tokens/output_tokens) of the most
+        # recent `draft()`/`translate_to_arabic()` call, for Slice B's cost
+        # tracking (see `app.core.ai_cost_control`). `None` until a call
+        # completes, and never set at all by a test double that doesn't
+        # define it - callers read this via `getattr(..., "last_usage",
+        # None)`, never assume it exists. Safe as a plain instance attribute
+        # (not shared state) because `get_content_drafter()` returns a fresh
+        # instance per caller, and nothing here awaits between setting it and
+        # a caller reading it back.
+        self.last_usage = None
+
     async def draft(self, approved_transcript: str, level: Level, title: str) -> DraftedContent:
         try:
             result = await _get_agent().run(
@@ -253,6 +265,7 @@ class GeminiContentDrafter:
             )
         except Exception as exc:
             raise ContentDraftingError(str(exc)) from exc
+        self.last_usage = result.usage
         return result.output
 
     async def translate_to_arabic(self, terms: list[str]) -> list[ArabicMeaning]:
@@ -262,6 +275,7 @@ class GeminiContentDrafter:
             result = await _get_translate_agent().run("Terms:\n" + "\n".join(f"- {term}" for term in terms))
         except Exception as exc:
             raise ContentDraftingError(str(exc)) from exc
+        self.last_usage = result.usage
         return result.output.translations
 
 

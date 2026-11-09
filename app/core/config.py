@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 import os
-from typing import Literal
+from typing import Literal, Optional
 from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
@@ -125,6 +125,32 @@ class Settings(BaseSettings):
     # Local CPU ASR for uploaded videos when they contain no subtitle track.
     # The model is downloaded/cached by faster-whisper on first use.
     LOCAL_ASR_MODEL: str = "base.en"
+
+    # AI cost controls (Slice B) - see `app.core.ai_cost_control`. Unset
+    # pricing means a generation's `estimated_cost_usd` is recorded as
+    # `None` rather than a guessed number - these are never invented here
+    # and must be set to the project's own currently-verified provider
+    # pricing before cost figures can be trusted for anything financial.
+    GEMINI_FLASH_INPUT_PRICE_PER_1K_TOKENS_USD: Optional[float] = None
+    GEMINI_FLASH_OUTPUT_PRICE_PER_1K_TOKENS_USD: Optional[float] = None
+    # A single lesson accumulating this many drafting/regeneration/review
+    # attempts within 24h almost certainly means a stuck UI or a runaway
+    # script, not normal authoring - conservative, generous default; raise
+    # it for a real bulk-authoring workflow rather than removing the guard.
+    MAX_AI_GENERATIONS_PER_TOPIC_PER_DAY: int = 40
+    # How long an "in_progress" generation claim may stand before a later
+    # identical request is allowed to reclaim it (the process that held it
+    # crashed/was redeployed) - same reclaim-on-timeout reasoning as
+    # `TRANSCRIPT_EXTRACTION_TIMEOUT_MINUTES`, just much shorter, since a
+    # drafting call is one request-response, not a multi-stage pipeline.
+    AI_GENERATION_STALE_CLAIM_MINUTES: int = 5
+    # Hard ceiling on how much approved source text is actually sent into a
+    # content/exercise drafting prompt - independent of whatever cap already
+    # applies when the text was written/approved (see
+    # `app.schema.limits.MAX_TRANSCRIPT_LENGTH`, 300,000 chars). That cap
+    # exists to make storage/approval sane; this one exists to keep a single
+    # drafting call's input tokens, and therefore its cost, bounded.
+    MAX_DRAFTING_SOURCE_CHARS: int = 20_000
 
     # Live "Discuss with Mariam" sessions (Phase 4) - this backend only mints
     # LiveKit room/access tokens (`LiveSessionService.start_session`); the

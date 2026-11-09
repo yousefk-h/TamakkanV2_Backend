@@ -206,6 +206,128 @@ async def test_ai_exercise_draft_is_grounded_teacher_scoped_and_not_saved(client
     assert client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()["lesson_exercises"] == []
 
 
+async def test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request(client):
+    """Slice B: simulates a true concurrent duplicate (two overlapping
+    requests racing on the same generation_key) by pre-claiming the lock
+    directly, the same way the service itself would mid-request - the
+    second, still-overlapping request must be refused (409) rather than
+    spending a second Gemini call, while a genuinely later request (after
+    the first finishes) is never blocked - see test_ai_cost_control.py for
+    the unit-level coverage of that distinction.
+    """
+    from app.core.ai_cost_control import claim_generation, compute_generation_key
+    from app.core.config import get_settings as _get_settings
+    from app.models.ai_generation import AIGenerationType
+
+    token = await _login(client, Role.TEACHER, "ai-exercise-concurrent@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her morning routine. " * 5
+    await stored.save()
+
+    body = {"kind": "reading", "count": 1}
+    bounded_source = stored.approved_transcript.strip()[: _get_settings().MAX_DRAFTING_SOURCE_CHARS]
+    key = compute_generation_key(
+        AIGenerationType.EXERCISE_DRAFT, topic_id=topic["id"], kind="reading", count=1, focus="", content="",
+        source=bounded_source, model="gemini-3.5-flash",
+    )
+    claim = await claim_generation(
+        generation_type=AIGenerationType.EXERCISE_DRAFT, generation_key=key, model="gemini-3.5-flash", topic_id=topic["id"],
+    )
+    try:
+        resp = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json=body, headers=headers)
+        assert resp.status_code == 409
+    finally:
+        from app.core.ai_cost_control import complete_generation
+        await complete_generation(claim, input_tokens=1, output_tokens=1)
+
+
+async def test_exercise_draft_enforces_the_per_topic_daily_budget(client, monkeypatch):
+    class FakeDrafter:
+        async def draft(self, **kwargs):
+            return [LessonExerciseIn(kind="reading", prompt="Q", content="C", options=["A", "B"], correct_option=0)]
+
+    from app.core.config import get_settings as _get_settings
+
+    monkeypatch.setenv("MAX_AI_GENERATIONS_PER_TOPIC_PER_DAY", "1")
+    _get_settings.cache_clear()
+
+    token = await _login(client, Role.TEACHER, "ai-exercise-budget@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her morning routine. " * 5
+    await stored.save()
+
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), FakeDrafter())
+    try:
+        first = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "reading", "count": 1}, headers=headers)
+        assert first.status_code == 200
+        second = client.post(
+            f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "grammar", "count": 1}, headers=headers
+        )
+        assert second.status_code == 422
+        assert "limit" in second.text.lower()
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+        monkeypatch.delenv("MAX_AI_GENERATIONS_PER_TOPIC_PER_DAY", raising=False)
+        _get_settings.cache_clear()
+
+
+async def test_student_topic_read_and_exercise_submission_never_call_an_ai_drafter(client, monkeypatch):
+    """Slice B's student-side zero-generation guarantee: opening a lesson
+    and submitting an exercise must never reach any AI drafting/review
+    provider, regardless of how many students do it. Monkeypatches every
+    drafting entry point to raise if called at all, then exercises the
+    real student-facing read/submit paths (same setup as
+    test_teacher_can_author_and_reorder_lesson_exercises above).
+    """
+    def _must_not_be_called(*_args, **_kwargs):
+        raise AssertionError("student-facing request must never call an AI provider")
+
+    import app.core.content_drafting as content_drafting
+    import app.core.exercise_drafting as exercise_drafting
+    import app.core.transcript_english_review as transcript_english_review
+
+    monkeypatch.setattr(content_drafting.GeminiContentDrafter, "draft", _must_not_be_called)
+    monkeypatch.setattr(content_drafting.GeminiContentDrafter, "translate_to_arabic", _must_not_be_called)
+    monkeypatch.setattr(exercise_drafting.GeminiExerciseDrafter, "draft", _must_not_be_called)
+    monkeypatch.setattr(transcript_english_review.GeminiTranscriptEnglishReviewer, "review", _must_not_be_called)
+
+    from app.utils.time import utcnow
+
+    token = await _login(client, Role.TEACHER, "ai-zero-gen-teacher@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    created = client.post("/api/v1/topics", json={"title": "Zero-gen lesson", "level": "beginner"}, headers=headers)
+    topic_id = created.json()["id"]
+    exercises = [
+        {"kind": "multiple_choice", "prompt": "2 + 2?", "options": ["3", "4"], "correct_option": 1, "explanation": "Four."},
+    ]
+    updated = client.patch(f"/api/v1/topics/{topic_id}", json={"lesson_exercises": exercises}, headers=headers)
+    assert updated.status_code == 200
+    revision = updated.json()["updated_at"]
+
+    teacher_id = client.get("/api/v1/me", headers=headers).json()["id"]
+    student_token = await _login(client, Role.STUDENT, "ai-zero-gen-student@example.com", plan=PlanType.STANDARD,
+                                 assigned_level=Level.BEGINNER, program_start_date=utcnow(), created_by_id=teacher_id)
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+    template = client.post("/api/v1/calendar-templates", json={"name": "Zero-gen plan", "kind": "standard", "level": "beginner",
+                                                           "days": [{"day": 1, "topic_ids": [topic_id]}]}, headers=headers)
+    assert client.post(f"/api/v1/calendar-templates/{template.json()['id']}/activate", headers=headers).status_code == 200
+
+    read = client.get(f"/api/v1/topics/{topic_id}", headers=student_headers)
+    assert read.status_code == 200
+
+    submitted = client.post(
+        "/api/v1/exercise-attempts",
+        json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": 1},
+        headers=student_headers,
+    )
+    assert submitted.status_code == 201
+    assert submitted.json()["correct"] is True
+
+
 async def test_creating_a_topic_rejects_a_playlist_url_instead_of_a_video_url(client):
     """A playlist link (`youtube.com/playlist?list=...`) passes the
     host/scheme allowlist but has no `v=` for any single video - it must be

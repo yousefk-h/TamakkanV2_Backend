@@ -62,18 +62,27 @@ from typing import Optional
 
 from loguru import logger
 
+from app.core.ai_cost_control import (
+    claim_generation,
+    compute_generation_key,
+    complete_generation,
+    fail_generation,
+    record_completed_without_tokens,
+)
 from app.core.config import get_settings
 from app.core.exceptions import ConflictException, NotFoundException, UnprocessableException
 from app.core.state_machine import InvalidTransition, transition
-from app.core.transcription import Transcriber, TranscriptionError, get_transcriber
+from app.core.transcription import MODEL as TRANSCRIPTION_MODEL, Transcriber, TranscriptionError, get_transcriber
 from app.core.local_video_transcription import UploadedVideoTranscriber, get_uploaded_video_transcriber
 from app.core.youtube import canonical_watch_url, fetch_video_duration_seconds
 from app.core.content_drafting import (
     GENERATOR_VERSION,
+    MODEL as CONTENT_DRAFTING_MODEL,
     ContentDrafter,
     ContentDraftingError,
     get_content_drafter,
 )
+from app.models.ai_generation import AIGenerationType
 from app.models.topic_content import (
     TRANSCRIPT_TRANSITIONS,
     TopicContent,
@@ -172,6 +181,18 @@ class TranscriptPipelineService:
                 segments.extend(youtube_segments)
                 sources.append(TranscriptSource.AI_GENERATED)
                 source_labels.extend(["YouTube video"] * len(youtube_segments))
+                # Usage-log only (not a dedup claim) - duplicate/concurrent
+                # transcript generation is already prevented by the
+                # transcript_state CAS above (`start_generation`'s
+                # `transition_state` call), so this call site's only job here
+                # is recording that a paid generation happened. Token counts
+                # aren't captured yet for this provider call (see Slice B's
+                # own HANDOFF note on why) - honestly `None`, not guessed.
+                await record_completed_without_tokens(
+                    generation_type=AIGenerationType.TRANSCRIPT_EXTRACTION,
+                    model=TRANSCRIPTION_MODEL,
+                    topic_id=topic_id,
+                )
             if topic.uploaded_video_url:
                 result = await self.uploaded_video_transcriber.transcribe(topic.uploaded_video_url)
                 filename = self._safe_source_name(topic.uploaded_video_filename or "Uploaded video")
@@ -291,7 +312,7 @@ class TranscriptPipelineService:
         self._require_draftable_source(topic)
         return topic
 
-    async def run_content_drafting(self, topic_id: str) -> None:
+    async def run_content_drafting(self, topic_id: str, requested_by_id: Optional[str] = None) -> None:
         """Runs after `approve_transcript` returns, via `BackgroundTasks` - a
         second real Gemini call per approval, same reasoning as
         `run_generation` for not blocking the approve request on it.
@@ -313,9 +334,9 @@ class TranscriptPipelineService:
         no CAS on the write itself because there is no concurrent *writer* of
         this same background job to race against, only a possible delete.
         """
-        await self._run_draft(topic_id, overwrite=False)
+        await self._run_draft(topic_id, overwrite=False, requested_by_id=requested_by_id)
 
-    async def run_regenerate_content(self, topic_id: str) -> None:
+    async def run_regenerate_content(self, topic_id: str, requested_by_id: Optional[str] = None) -> None:
         """The background half of a full regenerate (`start_regenerate_content`
         above) - same Gemini call as `run_content_drafting`, but every field
         the draft actually returned replaces whatever was there, including a
@@ -323,9 +344,9 @@ class TranscriptPipelineService:
         existing avatar prompt/opening line/warm-up questions/vocabulary, so
         there is no gap-filling judgment call to make here.
         """
-        await self._run_draft(topic_id, overwrite=True)
+        await self._run_draft(topic_id, overwrite=True, requested_by_id=requested_by_id)
 
-    async def _run_draft(self, topic_id: str, overwrite: bool) -> None:
+    async def _run_draft(self, topic_id: str, overwrite: bool, requested_by_id: Optional[str] = None) -> None:
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None or not topic.approved_transcript:
             return  # deleted, or approved with empty text (shouldn't happen - guarded in approve_transcript)
@@ -341,6 +362,28 @@ class TranscriptPipelineService:
             )
             return
 
+        if not overwrite and topic.vocabulary and topic.avatar_prompt and topic.opening_line and topic.warm_up_questions:
+            # Real, content-hash-independent waste this slice eliminates
+            # directly: a "fill only what's empty" pass has nothing left to
+            # fill when every target field already has a value - calling
+            # Gemini anyway (the pre-Slice-B behavior) would always discard
+            # every field it returned. Still runs the Arabic vocabulary
+            # backfill below, which has its own independent "anything
+            # missing?" gate and is not skipped by this one.
+            logger.info("Content draft skipped for topic {} - every target field is already filled", topic_id)
+            values: dict = {}
+            await self._fill_missing_arabic_meanings(topic_id, values, topic, requested_by_id)
+            if values:
+                await self.topic_repository.update_fields(topic_id, values)
+                logger.info("Content auto-drafted for topic {}: {}", topic_id, sorted(values))
+            return
+
+        # Bounds what actually reaches the drafting prompt, independent of
+        # whatever cap already applied when the transcript was approved (see
+        # Settings.MAX_DRAFTING_SOURCE_CHARS's own comment) - keeps a single
+        # drafting call's input tokens, and therefore its cost, bounded.
+        source_for_drafting = topic.approved_transcript[: get_settings().MAX_DRAFTING_SOURCE_CHARS]
+
         # Safe diagnostics only (card #18's investigation asked for exactly
         # this): lesson title and source character count, never the source
         # text itself - this is what should be checked first the next time a
@@ -350,19 +393,45 @@ class TranscriptPipelineService:
         # current code loaded at all - see that constant's own comment.
         logger.info(
             "GENERATOR_VERSION={} Drafting content for topic {} title={!r} level={} overwrite={} source_chars={}",
-            GENERATOR_VERSION, topic_id, topic.title, topic.level.value, overwrite, len(topic.approved_transcript),
+            GENERATOR_VERSION, topic_id, topic.title, topic.level.value, overwrite, len(source_for_drafting),
+        )
+
+        generation_type = AIGenerationType.CONTENT_REGENERATE if overwrite else AIGenerationType.CONTENT_DRAFT
+        generation_key = compute_generation_key(
+            generation_type,
+            topic_id=topic_id,
+            source=source_for_drafting,
+            title=topic.title,
+            level=topic.level.value,
+            model=CONTENT_DRAFTING_MODEL,
+        )
+        claim = await claim_generation(
+            generation_type=generation_type,
+            generation_key=generation_key,
+            model=CONTENT_DRAFTING_MODEL,
+            topic_id=topic_id,
+            requested_by_id=requested_by_id,
         )
 
         try:
-            draft = await self.content_drafter.draft(topic.approved_transcript, topic.level, topic.title)
+            draft = await self.content_drafter.draft(source_for_drafting, topic.level, topic.title)
         except ContentDraftingError as exc:
             # Best-effort: the teacher can still author all of this by hand in
             # Step3AvatarPrompt, so a failed draft is a missed convenience,
-            # not a broken pipeline.
+            # not a broken pipeline. The record is marked `failed` and the
+            # lock released - so a later request can retry immediately
+            # instead of being stuck as "busy".
+            await fail_generation(claim, exc)
             logger.opt(exception=True).warning(
                 "Content drafting failed for topic {}: {}", topic_id, exc
             )
             return
+        usage = getattr(self.content_drafter, "last_usage", None)
+        await complete_generation(
+            claim,
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+        )
 
         if len(draft.avatar_prompt) > MAX_PROMPT_LENGTH:
             # Defense in depth (card #19): the system prompt instructs a hard
@@ -394,7 +463,7 @@ class TranscriptPipelineService:
         if (overwrite or not current.warm_up_questions) and draft.warm_up_questions:
             values["warm_up_questions"] = draft.warm_up_questions
 
-        await self._fill_missing_arabic_meanings(topic_id, values, current)
+        await self._fill_missing_arabic_meanings(topic_id, values, current, requested_by_id)
 
         if not values:
             logger.info("Content drafting had nothing new to fill for topic {}", topic_id)
@@ -405,7 +474,9 @@ class TranscriptPipelineService:
             "regenerated" if overwrite else "auto-drafted", topic_id, sorted(values),
         )
 
-    async def _fill_missing_arabic_meanings(self, topic_id: str, values: dict, current: TopicContent) -> None:
+    async def _fill_missing_arabic_meanings(
+        self, topic_id: str, values: dict, current: TopicContent, requested_by_id: Optional[str] = None
+    ) -> None:
         """Backfills `arabic_meaning` on individual vocabulary items that are
         missing just that one field - unlike every other field above, this is
         gap-filling *within* a list the admin may have already curated by
@@ -421,9 +492,23 @@ class TranscriptPipelineService:
         vocabulary: list[dict] = (
             values["vocabulary"] if "vocabulary" in values else [item.model_dump() for item in current.vocabulary]
         )
-        missing_terms = [item["term"] for item in vocabulary if not item.get("arabic_meaning")]
+        missing_terms = sorted({item["term"] for item in vocabulary if not item.get("arabic_meaning")})
         if not missing_terms:
             return
+
+        generation_key = compute_generation_key(
+            AIGenerationType.VOCABULARY_ARABIC_BACKFILL,
+            topic_id=topic_id,
+            terms=missing_terms,
+            model=CONTENT_DRAFTING_MODEL,
+        )
+        claim = await claim_generation(
+            generation_type=AIGenerationType.VOCABULARY_ARABIC_BACKFILL,
+            generation_key=generation_key,
+            model=CONTENT_DRAFTING_MODEL,
+            topic_id=topic_id,
+            requested_by_id=requested_by_id,
+        )
 
         try:
             translations = await self.content_drafter.translate_to_arabic(missing_terms)
@@ -431,10 +516,17 @@ class TranscriptPipelineService:
             # Same best-effort reasoning as the main draft call: a failed
             # translation pass leaves these terms without an Arabic meaning,
             # exactly as they were before this call - not a broken topic.
+            await fail_generation(claim, exc)
             logger.opt(exception=True).warning(
                 "Arabic-meaning backfill failed for topic {}: {}", topic_id, exc
             )
             return
+        usage = getattr(self.content_drafter, "last_usage", None)
+        await complete_generation(
+            claim,
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+        )
 
         by_term = {t.term: t.arabic_meaning for t in translations if t.arabic_meaning}
         filled_any = False

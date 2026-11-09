@@ -81,11 +81,17 @@ def _get_agent() -> Agent[None, TranscriptReviewResult]:
 
 
 class GeminiTranscriptEnglishReviewer:
+    def __init__(self) -> None:
+        # See `GeminiContentDrafter.last_usage`'s own comment - same pattern,
+        # same reasoning (fresh instance per `get_english_reviewer()` call).
+        self.last_usage = None
+
     async def review(self, transcript: str) -> TranscriptReviewResult:
         try:
             result = await _get_agent().run(transcript)
         except Exception as exc:
             raise TranscriptReviewError(str(exc)) from exc
+        self.last_usage = result.usage
         return result.output
 
 

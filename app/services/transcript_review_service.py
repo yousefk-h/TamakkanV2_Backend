@@ -8,12 +8,23 @@ pipeline collaborators for a genuinely different concern (the transcript
 state machine) - this one only ever needs a topic lookup and the reviewer.
 """
 
+from typing import Optional
+
+from app.core.ai_cost_control import (
+    claim_generation,
+    compute_generation_key,
+    complete_generation,
+    fail_generation,
+)
 from app.core.exceptions import ConflictException, NotFoundException, UnprocessableException
 from app.core.transcript_english_review import (
+    MODEL,
     TranscriptEnglishReviewer,
+    TranscriptReviewError,
     TranscriptReviewResult,
     get_english_reviewer,
 )
+from app.models.ai_generation import AIGenerationType
 from app.models.topic_content import TranscriptState
 from app.repositories.topic_content_repository import TopicContentRepository
 
@@ -23,7 +34,9 @@ class TranscriptReviewService:
         self.topic_repository = topic_repository
         self.reviewer = reviewer
 
-    async def review_english(self, topic_id: str, transcript: str) -> TranscriptReviewResult:
+    async def review_english(
+        self, topic_id: str, transcript: str, requested_by_id: Optional[str] = None
+    ) -> TranscriptReviewResult:
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None:
             raise NotFoundException("Topic not found")
@@ -35,7 +48,37 @@ class TranscriptReviewService:
             raise ConflictException("This transcript is already approved - there is nothing left to review")
         if not transcript.strip():
             raise UnprocessableException("There is no transcript text to review")
-        return await self.reviewer.review(transcript)
+
+        # Purely advisory and never persisted (see this module's own
+        # docstring) - blocks only a genuinely concurrent duplicate request
+        # (see `claim_generation`'s own docstring); a later, sequential
+        # re-review of the same text is always allowed.
+        generation_key = compute_generation_key(
+            AIGenerationType.TRANSCRIPT_ENGLISH_REVIEW,
+            topic_id=topic_id,
+            transcript=transcript,
+            model=MODEL,
+        )
+        claim = await claim_generation(
+            generation_type=AIGenerationType.TRANSCRIPT_ENGLISH_REVIEW,
+            generation_key=generation_key,
+            model=MODEL,
+            topic_id=topic_id,
+            requested_by_id=requested_by_id,
+        )
+
+        try:
+            result = await self.reviewer.review(transcript)
+        except TranscriptReviewError as exc:
+            await fail_generation(claim, exc)
+            raise
+        usage = getattr(self.reviewer, "last_usage", None)
+        await complete_generation(
+            claim,
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+        )
+        return result
 
 
 def get_transcript_review_service() -> TranscriptReviewService:

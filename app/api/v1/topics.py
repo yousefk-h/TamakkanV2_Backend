@@ -371,7 +371,7 @@ async def approve_transcript(
     """
     await topic_service.get_own_topic(topic_id, admin)
     topic = await service.approve_transcript(topic_id, edited_transcript=body.approved_transcript)
-    background_tasks.add_task(service.run_content_drafting, topic_id)
+    background_tasks.add_task(service.run_content_drafting, topic_id, admin.id)
     return TopicPublic.from_topic(topic, include_internal=True)
 
 
@@ -395,7 +395,7 @@ async def draft_content(
     """
     await topic_service.get_own_topic(topic_id, admin)
     topic = await service.start_content_drafting(topic_id)
-    background_tasks.add_task(service.run_content_drafting, topic_id)
+    background_tasks.add_task(service.run_content_drafting, topic_id, admin.id)
     return TopicPublic.from_topic(topic, include_internal=True)
 
 
@@ -417,7 +417,7 @@ async def regenerate_content(
     """
     await topic_service.get_own_topic(topic_id, admin)
     topic = await service.start_regenerate_content(topic_id)
-    background_tasks.add_task(service.run_regenerate_content, topic_id)
+    background_tasks.add_task(service.run_regenerate_content, topic_id, admin.id)
     return TopicPublic.from_topic(topic, include_internal=True)
 
 
@@ -425,7 +425,7 @@ async def regenerate_content(
 async def review_transcript_english(
     topic_id: str,
     body: ReviewTranscriptEnglishRequest,
-    _: User = Depends(require_teacher_or_administrator),
+    admin: User = Depends(require_teacher_or_administrator),
     service: TranscriptReviewService = Depends(get_transcript_review_service),
 ) -> TranscriptReviewResult:
     """Administrator only. Proofreads the given transcript text for English
@@ -434,4 +434,4 @@ async def review_transcript_english(
     whether to apply `corrected_transcript` into their edit box, tweak it
     further, or ignore it and approve the original.
     """
-    return await service.review_english(topic_id, body.transcript)
+    return await service.review_english(topic_id, body.transcript, requested_by_id=admin.id)

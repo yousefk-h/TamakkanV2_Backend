@@ -24,6 +24,7 @@ from pymongo import AsyncMongoClient
 from beanie import init_beanie
 
 from app.core.config import get_settings
+from app.models.ai_generation import AIGenerationLock, AIGenerationRecord
 from app.models.alert_log import AlertLog
 from app.models.audit_log import AuditLog
 from app.models.calendar_template import CalendarTemplate
@@ -70,6 +71,8 @@ DOCUMENT_MODELS: list = [
     ProgramTopic,
     Cohort,
     Enrollment,
+    AIGenerationRecord,
+    AIGenerationLock,
 ]
 
 

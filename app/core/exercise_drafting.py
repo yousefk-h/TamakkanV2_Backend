@@ -68,6 +68,11 @@ def _get_agent() -> Agent[None, DraftExerciseOutput]:
 
 
 class GeminiExerciseDrafter:
+    def __init__(self) -> None:
+        # See `GeminiContentDrafter.last_usage`'s own comment - same pattern,
+        # same reasoning (fresh instance per `get_exercise_drafter()` call).
+        self.last_usage = None
+
     async def draft(self, *, title: str, level: Level, source: str, kind: ExerciseKind,
                     count: int, focus: str, content: str) -> list[LessonExerciseIn]:
         if not get_settings().GEMINI_API_KEY:
@@ -80,6 +85,7 @@ class GeminiExerciseDrafter:
             )
         except Exception as exc:
             raise ExerciseDraftingError(str(exc)) from exc
+        self.last_usage = result.usage
         return result.output.exercises
 
 
