@@ -56,6 +56,7 @@ from app.services.transcript_review_service import (
 )
 from app.services.enrollment_service import EnrollmentService, get_enrollment_service
 from app.services.exercise_draft_service import DraftExercisesRequest, DraftExercisesResponse, ExerciseDraftService, get_exercise_draft_service
+from app.services.lesson_draft_service import LessonDraftService, get_lesson_draft_service
 
 router = APIRouter()
 
@@ -214,6 +215,72 @@ async def draft_lesson_exercises(
 ) -> DraftExercisesResponse:
     """Generate editable suggestions from approved source text; never saves them."""
     return await service.draft(topic_id, teacher, body)
+
+
+@router.post("/topics/{topic_id}/generate-lesson-draft", response_model=TopicPublic, status_code=202)
+async def generate_lesson_draft(
+    topic_id: str,
+    background_tasks: BackgroundTasks,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: LessonDraftService = Depends(get_lesson_draft_service),
+) -> TopicPublic:
+    """The unified "Generate Lesson Draft" action (Slice C): one request
+    orchestrates content drafting (whatever of avatar_prompt/opening_line/
+    warm_up_questions/vocabulary is still empty) and a small, bounded
+    default set of exercise-kind suggestions, reusing the exact same
+    cost-controlled call sites as the existing per-field/per-card actions.
+    422 before any provider call if the topic's remaining daily generation
+    budget can't cover the planned number of requests, or if there is
+    nothing left to draft. 409 if a draft is already running for this
+    topic. Exercise suggestions land in `draft_exercises`, never directly
+    in the published `lesson_exercises` - see accept/reject/regenerate
+    below. Poll `GET /topics/{topic_id}` for `lesson_draft_job` progress.
+    """
+    topic = await service.start(topic_id, teacher)
+    background_tasks.add_task(service.run, topic_id, teacher.id)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/draft-exercises/{index}/accept", response_model=TopicPublic)
+async def accept_lesson_draft_exercise(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: LessonDraftService = Depends(get_lesson_draft_service),
+) -> TopicPublic:
+    """Moves one pending AI-suggested exercise into the real, published
+    `lesson_exercises` list. Never touches any other suggestion or any
+    manually-authored exercise."""
+    topic = await service.accept_suggestion(topic_id, index, teacher)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/draft-exercises/{index}/reject", response_model=TopicPublic)
+async def reject_lesson_draft_exercise(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: LessonDraftService = Depends(get_lesson_draft_service),
+) -> TopicPublic:
+    """Discards one pending AI-suggested exercise. It was never saved
+    anywhere a student could reach it."""
+    topic = await service.reject_suggestion(topic_id, index, teacher)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/draft-exercises/{index}/regenerate", response_model=TopicPublic)
+async def regenerate_lesson_draft_exercise(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: LessonDraftService = Depends(get_lesson_draft_service),
+) -> TopicPublic:
+    """Replaces one pending suggestion with a fresh draft of the same
+    exercise kind - goes through the same concurrent-duplicate guard and
+    daily budget check as the initial draft. Never touches any other
+    suggestion or any already-accepted/manually-authored exercise."""
+    topic = await service.regenerate_suggestion(topic_id, index, teacher)
+    return TopicPublic.from_topic(topic, include_internal=True)
 
 
 @router.delete("/topics/{topic_id}", status_code=204)

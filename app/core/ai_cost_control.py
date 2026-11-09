@@ -68,6 +68,26 @@ class GenerationBudgetExceeded(UnprocessableException):
     pass
 
 
+async def remaining_topic_budget(topic_id: Optional[str]) -> int:
+    """How many more generation attempts this topic may make in the next
+    24h before `enforce_topic_budget` would refuse one - used by a bulk
+    orchestration (Slice C's "Generate Lesson Draft") to check, up front,
+    whether its planned number of calls can actually all run, rather than
+    starting and failing partway through on the budget alone. A topic_id
+    of `None` has no budget at all (unlimited), matching
+    `enforce_topic_budget`'s own no-op for that case.
+    """
+    if topic_id is None:
+        return 2**31
+    limit = get_settings().MAX_AI_GENERATIONS_PER_TOPIC_PER_DAY
+    since = utcnow() - timedelta(days=1)
+    count = await AIGenerationRecord.find(
+        AIGenerationRecord.topic_id == topic_id,
+        AIGenerationRecord.started_at >= since,
+    ).count()
+    return max(0, limit - count)
+
+
 async def enforce_topic_budget(topic_id: Optional[str]) -> None:
     """A topic accumulating an unreasonable number of generation attempts in
     a day is almost certainly a stuck UI or a runaway script - not a real

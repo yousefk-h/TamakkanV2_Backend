@@ -33,6 +33,8 @@ from app.models.topic_content import (
     ExercisePair,
     Level,
     LessonExercise,
+    LessonDraftExerciseSuggestion,
+    LessonDraftJob,
     PracticeScheduleBlock,
     SentenceStarterBlock,
     TopicContent,
@@ -394,6 +396,11 @@ class TopicPublic(BaseSchema):
     pdf_url: Optional[str] = None
     pdf_filename: Optional[str] = None
     pdf_extracted_text: Optional[str] = None
+    # AI-suggested exercises awaiting teacher review (Slice C) - same
+    # disclosure rule as avatar_prompt/raw_transcript: a draft is authoring
+    # material, never shown to a student. See LessonDraftExerciseSuggestion.
+    draft_exercises: list[LessonDraftExerciseSuggestion] = Field(default_factory=list)
+    lesson_draft_job: Optional[LessonDraftJob] = None
 
     @classmethod
     def from_topic(
@@ -421,6 +428,8 @@ class TopicPublic(BaseSchema):
                 "pdf_url": topic.pdf_url,
                 "pdf_filename": topic.pdf_filename,
                 "pdf_extracted_text": topic.pdf_extracted_text,
+                "draft_exercises": topic.draft_exercises,
+                "lesson_draft_job": topic.lesson_draft_job,
             }
             if include_internal
             else {}

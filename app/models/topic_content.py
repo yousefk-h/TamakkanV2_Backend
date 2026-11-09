@@ -157,6 +157,53 @@ class TopicRevisionSnapshot(BaseModel):
     content: dict[str, Any]
 
 
+class LessonDraftStepState(str, Enum):
+    """One step's status within a `LessonDraftJob` - distinct from
+    `AIGenerationStatus` (app.models.ai_generation), which tracks one
+    provider call; a step here can resolve to `skipped` without ever
+    calling a provider at all (see `LessonDraftService._plan`)."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class LessonDraftExerciseSuggestion(BaseModel):
+    """One AI-suggested exercise, pending teacher review - never merged into
+    `lesson_exercises` (the published/saved list) until the teacher explicitly
+    accepts it (see `LessonDraftService.accept_suggestion`). Teacher-rejected
+    or never-accepted suggestions are simply removed/replaced; nothing here
+    is ever shown to a student."""
+
+    kind: ExerciseKind
+    exercise: LessonExercise
+    state: LessonDraftStepState = LessonDraftStepState.DONE
+    error: Optional[str] = None
+
+
+class LessonDraftJob(BaseModel):
+    """Progress/status for one "Generate Lesson Draft" orchestration run
+    (Slice C) - polled via the ordinary `GET /topics/{id}` an admin already
+    uses, not a separate endpoint. `content_step` covers avatar_prompt/
+    opening_line/warm_up_questions/vocabulary (one combined Gemini call, see
+    `TranscriptPipelineService.run_content_drafting`); `exercise_steps` maps
+    each planned `ExerciseKind.value` this run attempted to its own status,
+    so a teacher sees exactly which exercise kinds succeeded, were skipped
+    (already present), or failed - and a failed kind can be retried without
+    repeating the ones that already succeeded.
+    """
+
+    state: LessonDraftStepState = LessonDraftStepState.PENDING
+    content_step: LessonDraftStepState = LessonDraftStepState.PENDING
+    exercise_steps: dict[str, LessonDraftStepState] = Field(default_factory=dict)
+    planned_calls: int = 0
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+
 class TopicContent(BaseDocument):
     title: str
     # Legacy/default difficulty for library filtering and unplaced topics.
@@ -214,6 +261,11 @@ class TopicContent(BaseDocument):
     sentence_starters: list[SentenceStarterBlock] = Field(default_factory=list)
     suggested_practice_schedule: list[PracticeScheduleBlock] = Field(default_factory=list)
     lesson_exercises: list[LessonExercise] = Field(default_factory=list)
+    # AI-suggested exercises awaiting teacher review (Slice C) - never
+    # shown to a student and never counted as part of the published
+    # lesson; see `LessonDraftExerciseSuggestion`'s own docstring.
+    draft_exercises: list[LessonDraftExerciseSuggestion] = Field(default_factory=list)
+    lesson_draft_job: Optional[LessonDraftJob] = None
 
     transcript_state: TranscriptState = TranscriptState.QUEUED
     # When the current `extracting` run claimed this topic. `extracting` is the
