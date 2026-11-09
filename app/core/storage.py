@@ -213,6 +213,13 @@ class CloudinaryLessonAudioStorage:
         except Exception as exc:
             raise UploadFailedError(str(exc)) from exc
 
+    async def delete(self, public_id: str) -> None:
+        _ensure_configured()
+        try:
+            await run_in_threadpool(cloudinary.uploader.destroy, public_id, resource_type="video", type="upload")
+        except Exception as exc:
+            raise UploadFailedError(str(exc)) from exc
+
 
 def get_lesson_audio_storage() -> CloudinaryLessonAudioStorage:
     return CloudinaryLessonAudioStorage()

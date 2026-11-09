@@ -1,9 +1,10 @@
-"""Kanban card #11: transcribe a topic's YouTube video with Gemini
-(`app.core.transcription`) directly from the URL - no download, no
-chunking. Then a teacher review queue - `PENDING_REVIEW` -> `APPROVED_FOR_AI`,
-gated by an explicit approve action. `approved_transcript` stays empty until
-that action runs, so nothing later (the prompt-assembly service, card #13)
-could ever pick up an unapproved one.
+"""Builds a teacher-reviewed source document for each lesson.
+
+YouTube URLs keep the established Gemini path. Teacher-uploaded videos use
+embedded captions first and local faster-whisper ASR second; uploaded PDFs
+use deterministic text extraction. A lesson can combine all three. Source
+text stays verbatim in `raw_transcript`, while `transcript_source_labels`
+adds explicit boundaries for teacher review and downstream AI generation.
 
 Previously tried fetching real YouTube captions first via the private
 InnerTube API (`app.core.innertube_client`, removed), falling back to Gemini
@@ -12,17 +13,11 @@ consistently blocked in production - every client identity tried
 (`WEB`, `ANDROID`, an embedded-player client) got rejected with YouTube's
 literal "Sign in to confirm you're not a bot" challenge from the deployed
 server's IP, which no request-shape/client-identity change can pass (it
-needs either real sign-in cookies or solving a JS challenge). Gemini is now
-the only path, so `TopicContent.transcript_source` is currently always
-`TranscriptSource.AI_GENERATED` - kept (rather than removed) so the
-review UI's "this transcript was AI-generated" notice keeps working, and so
-a future real-captions path (e.g. behind a proxy) wouldn't need a schema
-change to slot back in.
+needs either real sign-in cookies or solving a JS challenge). Gemini therefore
+remains the YouTube fallback, but is never used for uploaded video files.
 
-Only `topic.youtube_urls[0]` is processed. The model allows more than one URL
-per topic, but stitching several videos' transcripts into one document for a
-single topic wasn't asked for, and it's not obvious it should even mean
-anything - a genuine scope decision, not an oversight.
+Only `topic.youtube_urls[0]` is processed; an uploaded video and a PDF are
+separate additional sources.
 
 Video-optional (card #16): a topic may instead (or also) carry an uploaded
 PDF, whose text was already extracted at upload time (see
@@ -71,6 +66,7 @@ from app.core.config import get_settings
 from app.core.exceptions import ConflictException, NotFoundException, UnprocessableException
 from app.core.state_machine import InvalidTransition, transition
 from app.core.transcription import Transcriber, TranscriptionError, get_transcriber
+from app.core.local_video_transcription import UploadedVideoTranscriber, get_uploaded_video_transcriber
 from app.core.youtube import canonical_watch_url, fetch_video_duration_seconds
 from app.core.content_drafting import (
     GENERATOR_VERSION,
@@ -119,15 +115,17 @@ class TranscriptPipelineService:
         transcriber: Transcriber,
         content_drafter: ContentDrafter,
         extraction_timeout: timedelta,
+        uploaded_video_transcriber: UploadedVideoTranscriber | None = None,
     ) -> None:
         self.topic_repository = topic_repository
         self.transcriber = transcriber
         self.content_drafter = content_drafter
         self.extraction_timeout = extraction_timeout
+        self.uploaded_video_transcriber = uploaded_video_transcriber or get_uploaded_video_transcriber()
 
     async def start_generation(self, topic_id: str) -> TopicContent:
         topic = await self._get_or_404(topic_id)
-        if not topic.youtube_urls and not topic.pdf_extracted_text:
+        if not topic.youtube_urls and not topic.uploaded_video_url and not topic.pdf_extracted_text:
             # Video-optional (card #16): a topic needs *some* source
             # material - a video, a PDF, or both - never neither.
             raise UnprocessableException("Topic has no video or PDF source to generate from")
@@ -167,10 +165,24 @@ class TranscriptPipelineService:
             # concatenates every segment's text generically, so a topic
             # with both sources needs no special-casing there.
             segments: list[TranscriptSegment] = []
+            sources: list[TranscriptSource] = []
+            source_labels: list[str] = []
             if topic.youtube_urls:
-                segments.extend(await self._fetch_transcript(topic.youtube_urls[0]))
+                youtube_segments = await self._fetch_transcript(topic.youtube_urls[0])
+                segments.extend(youtube_segments)
+                sources.append(TranscriptSource.AI_GENERATED)
+                source_labels.extend(["YouTube video"] * len(youtube_segments))
+            if topic.uploaded_video_url:
+                result = await self.uploaded_video_transcriber.transcribe(topic.uploaded_video_url)
+                filename = self._safe_source_name(topic.uploaded_video_filename or "Uploaded video")
+                segments.append(TranscriptSegment(text=result.text, start=0.0, duration=0.0))
+                sources.append(result.source)
+                source_labels.append(f"Uploaded video — {filename}")
             if topic.pdf_extracted_text:
+                filename = self._safe_source_name(topic.pdf_filename or "PDF document")
                 segments.append(TranscriptSegment(text=topic.pdf_extracted_text, start=0.0, duration=0.0))
+                sources.append(TranscriptSource.EXTRACTED_TEXT)
+                source_labels.append(f"PDF — {filename}")
         except Exception as exc:
             # Broad on purpose - see the module docstring. There is no caller
             # left to raise to, and anything that escapes here leaves the topic
@@ -184,7 +196,8 @@ class TranscriptPipelineService:
             expected=TranscriptState.EXTRACTING,
             target=TranscriptState.PENDING_REVIEW,
             raw_transcript=segments,
-            transcript_source=TranscriptSource.AI_GENERATED,
+            transcript_source_labels=source_labels,
+            transcript_source=sources[0] if len(sources) == 1 else TranscriptSource.MIXED,
             transcript_state_started_at=None,
         )
         if not stored:
@@ -196,6 +209,10 @@ class TranscriptPipelineService:
             )
             return
         logger.info("Transcript ready for review: topic={} segments={}", topic_id, len(segments))
+
+    @staticmethod
+    def _safe_source_name(value: str) -> str:
+        return value.replace("\r", " ").replace("\n", " ").replace("]", ")").strip()[:160]
 
     async def approve_transcript(
         self, topic_id: str, edited_transcript: Optional[str] = None
@@ -211,11 +228,19 @@ class TranscriptPipelineService:
             # generation at all.
             raise UnprocessableException("There is no transcript to approve for this topic")
 
-        approved = (
-            edited_transcript.strip()
-            if edited_transcript is not None
-            else " ".join(segment.text.strip() for segment in topic.raw_transcript).strip()
-        )
+        if edited_transcript is not None:
+            approved = edited_transcript.strip()
+        elif len(set(topic.transcript_source_labels)) > 1:
+            groups: list[tuple[str, list[str]]] = []
+            for index, segment in enumerate(topic.raw_transcript):
+                label = topic.transcript_source_labels[index] if index < len(topic.transcript_source_labels) else f"Source {index + 1}"
+                if groups and groups[-1][0] == label:
+                    groups[-1][1].append(segment.text.strip())
+                else:
+                    groups.append((label, [segment.text.strip()]))
+            approved = "\n\n".join(f"[SOURCE: {label}]\n{' '.join(texts)}" for label, texts in groups).strip()
+        else:
+            approved = " ".join(segment.text.strip() for segment in topic.raw_transcript).strip()
         if not approved:
             raise UnprocessableException("There is no transcript to approve for this topic")
         if not await self.topic_repository.transition_state(
@@ -485,4 +510,5 @@ def get_transcript_pipeline_service() -> TranscriptPipelineService:
         get_transcriber(),
         get_content_drafter(),
         extraction_timeout=timedelta(minutes=settings.TRANSCRIPT_EXTRACTION_TIMEOUT_MINUTES),
+        uploaded_video_transcriber=get_uploaded_video_transcriber(),
     )

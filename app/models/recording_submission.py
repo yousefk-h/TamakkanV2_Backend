@@ -47,6 +47,9 @@ class RecordingSubmission(BaseDocument):
     # compound indexes in `Settings` rather than on its own - it is the leading
     # field of both, so a standalone index would be redundant.
     student_id: str
+    # Enrollment context at submission time. Optional preserves legacy rows.
+    program_id: Optional[str] = None
+    program_level_id: Optional[str] = None
 
     kind: SubmissionKind
     # Both `None` for an end-of-week video (day-tied, not topic-tied) - both

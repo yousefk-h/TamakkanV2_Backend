@@ -11,6 +11,7 @@ import pytest
 
 from app.core.exceptions import ConflictException, NotFoundException, UnprocessableException
 from app.core.transcription import TranscriptionError
+from app.core.local_video_transcription import LocalVideoTranscript
 from app.core.content_drafting import ArabicMeaning, ContentDraftingError, DraftedContent
 from app.models.topic_content import (
     Level,
@@ -36,6 +37,17 @@ class FakeTranscriber:
         if self.error is not None:
             raise self.error
         return self.text
+
+
+class FakeUploadedVideoTranscriber:
+    def __init__(self, text="local video words", source=TranscriptSource.LOCAL_ASR):
+        self.text = text
+        self.source = source
+        self.calls: list[str] = []
+
+    async def transcribe(self, video_url):
+        self.calls.append(video_url)
+        return LocalVideoTranscript(self.text, self.source)
 
 
 class FakeContentDrafter:
@@ -72,12 +84,14 @@ def _make_service(
     transcriber=None,
     content_drafter=None,
     extraction_timeout=timedelta(minutes=30),
+    uploaded_video_transcriber=None,
 ):
     return TranscriptPipelineService(
         TopicContentRepository(),
         transcriber or FakeTranscriber(),
         content_drafter or FakeContentDrafter(),
         extraction_timeout=extraction_timeout,
+        uploaded_video_transcriber=uploaded_video_transcriber or FakeUploadedVideoTranscriber(),
     )
 
 
@@ -135,6 +149,35 @@ async def test_run_generation_transcribes_via_gemini():
     assert refreshed.raw_transcript[0].start == 0.0
     assert refreshed.transcript_source == TranscriptSource.AI_GENERATED
     assert transcriber.calls == [topic.youtube_urls[0]]
+
+
+async def test_uploaded_video_and_pdf_are_labeled_and_never_sent_to_gemini():
+    topic = await _make_topic(youtube_urls=())
+    topic.uploaded_video_url = "https://cdn.example/lesson.mp4"
+    topic.uploaded_video_filename = "lesson.mp4"
+    topic.pdf_filename = "notes.pdf"
+    topic.pdf_extracted_text = "Support notes for the lesson."
+    await topic.save()
+    gemini = FakeTranscriber(error=AssertionError("uploaded videos must not use Gemini"))
+    local = FakeUploadedVideoTranscriber(text="Words spoken in the video.")
+    service = _make_service(transcriber=gemini, uploaded_video_transcriber=local)
+
+    await service.start_generation(topic.id)
+    await service.run_generation(topic.id)
+    pending = await TopicContent.get(topic.id)
+
+    assert [segment.text for segment in pending.raw_transcript] == [
+        "Words spoken in the video.",
+        "Support notes for the lesson.",
+    ]
+    assert pending.transcript_source_labels == ["Uploaded video — lesson.mp4", "PDF — notes.pdf"]
+    assert pending.transcript_source == TranscriptSource.MIXED
+    assert local.calls == [topic.uploaded_video_url]
+    assert gemini.calls == []
+
+    approved = await service.approve_transcript(topic.id)
+    assert "[SOURCE: Uploaded video — lesson.mp4]" in approved.approved_transcript
+    assert "[SOURCE: PDF — notes.pdf]" in approved.approved_transcript
 
 
 async def test_run_generation_passes_gemini_a_canonical_url_stripped_of_playlist_params():

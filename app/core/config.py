@@ -122,6 +122,9 @@ class Settings(BaseSettings):
     # slowest realistic generation (queued behind other extractions, plus
     # retries), or a live run could be reclaimed underneath itself.
     TRANSCRIPT_EXTRACTION_TIMEOUT_MINUTES: int = 30
+    # Local CPU ASR for uploaded videos when they contain no subtitle track.
+    # The model is downloaded/cached by faster-whisper on first use.
+    LOCAL_ASR_MODEL: str = "base.en"
 
     # Live "Discuss with Mariam" sessions (Phase 4) - this backend only mints
     # LiveKit room/access tokens (`LiveSessionService.start_session`); the

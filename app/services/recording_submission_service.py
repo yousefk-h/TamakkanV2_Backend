@@ -159,6 +159,8 @@ class RecordingSubmissionService:
             submission = RecordingSubmission(
                 student=student,
                 student_id=student.id,
+                program_id=student.program_id,
+                program_level_id=student.program_level_id,
                 kind=SubmissionKind.AUDIO_TASK,
                 topic=topic,
                 topic_id=topic_id,
@@ -208,6 +210,8 @@ class RecordingSubmissionService:
             submission = RecordingSubmission(
                 student=student,
                 student_id=student.id,
+                program_id=student.program_id,
+                program_level_id=student.program_level_id,
                 kind=SubmissionKind.END_OF_WEEK_VIDEO,
                 topic=None,
                 topic_id=None,
