@@ -17,6 +17,7 @@ import pytest
 from jose import jwt as jose_jwt
 
 from app.core.config import get_settings
+from app.core.prompt_safety import wrap_untrusted_lesson_content
 from app.models.calendar_template import CalendarDayEntry, CalendarTemplate, TemplateKind
 from app.models.live_session import EndReason, LiveSession, PracticeMode, SessionState
 from app.models.topic_content import Level, TopicContent, VoicePromptMode
@@ -171,8 +172,10 @@ async def test_old_lesson_without_voice_fields_uses_avatar_prompt_for_both_modes
 
     _, voice_meta = _dispatch(_start(client, token, topic.id).json())
     _, avatar_meta = _dispatch(_start(client, token, topic.id, mode=None).json())
-    assert voice_meta["lesson_prompt"] == "Talk about music."
-    assert avatar_meta["topic_instructions"] == "Talk about music."
+    # Wrapped in an explicit "lesson reference material" boundary (see
+    # app.core.prompt_safety) rather than sent as the raw string.
+    assert "Talk about music." in voice_meta["lesson_prompt"]
+    assert "Talk about music." in avatar_meta["topic_instructions"]
 
 
 async def test_shared_prompt_is_created_once_and_sent_to_both_agents(client):
@@ -209,9 +212,9 @@ async def test_separate_prompts_send_each_agent_only_its_own_prompt(client):
     _, voice_meta = _dispatch(_start(client, token, created["id"]).json())
     _, avatar_meta = _dispatch(_start(client, token, created["id"], mode="topic_discussion").json())
 
-    assert voice_meta["lesson_prompt"] == "VOICE-ONLY prompt"
+    assert "VOICE-ONLY prompt" in voice_meta["lesson_prompt"]
     assert "AVATAR-ONLY" not in json.dumps(voice_meta)
-    assert avatar_meta["topic_instructions"] == "AVATAR-ONLY prompt"
+    assert "AVATAR-ONLY prompt" in avatar_meta["topic_instructions"]
     assert "VOICE-ONLY" not in json.dumps(avatar_meta)
 
 
@@ -281,7 +284,9 @@ async def test_voice_start_dispatches_only_the_voice_agent_with_the_saved_lesson
         "topic_id": topic.id,
         "max_duration_minutes": 15,
         "lesson_title": "Talking about Music",
-        "lesson_prompt": "voice prompt",
+        # Wrapped in an explicit "lesson reference material" boundary (see
+        # app.core.prompt_safety) rather than sent as the raw string.
+        "lesson_prompt": wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", "voice prompt"),
         "opening_line": "Hi there!",
         "level": "intermediate",
         "arabic_support_enabled": None,
@@ -311,7 +316,7 @@ async def test_avatar_dispatch_is_unchanged(client):
             "session_id", "topic_id", "max_duration_minutes", "topic_instructions", "opening_line", "level",
             "arabic_support_enabled", "arabic_intervention_level",
         }
-        assert metadata["topic_instructions"] == "avatar"
+        assert metadata["topic_instructions"] == wrap_untrusted_lesson_content("TOPIC INSTRUCTIONS", "avatar")
         # Unset on this fixture topic (predates the field) - the Avatar agent
         # treats `None` the same as `False` (see `MariamAgent`), unlike Voice
         # Practice's own legacy-default-on behavior.
@@ -358,7 +363,8 @@ async def test_client_cannot_supply_prompt_or_level(client):
         headers=_auth(token),
     )
     _, metadata = _dispatch(resp.json())
-    assert metadata["lesson_prompt"] == "saved prompt" and metadata["level"] == "intermediate"
+    assert metadata["lesson_prompt"] == wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", "saved prompt")
+    assert metadata["level"] == "intermediate"
     assert _start(client, token, topic.id, mode="something_else").status_code == 422
 
 
@@ -381,8 +387,10 @@ async def test_mixed_level_students_in_one_class_each_get_only_their_own_lesson(
 
     _, b_meta = _dispatch(_start(client, beginner_token, beginner_lesson.id).json())
     _, a_meta = _dispatch(_start(client, advanced_token, advanced_lesson.id).json())
-    assert (b_meta["lesson_prompt"], b_meta["level"]) == ("BEGINNER prompt", "beginner")
-    assert (a_meta["lesson_prompt"], a_meta["level"]) == ("ADVANCED prompt", "advanced")
+    assert b_meta["lesson_prompt"] == wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", "BEGINNER prompt")
+    assert b_meta["level"] == "beginner"
+    assert a_meta["lesson_prompt"] == wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", "ADVANCED prompt")
+    assert a_meta["level"] == "advanced"
     # Neither can open the other level's lesson.
     assert _start(client, beginner_token, advanced_lesson.id).status_code == 403
     assert _start(client, advanced_token, beginner_lesson.id).status_code == 403
@@ -413,8 +421,12 @@ async def test_two_students_start_different_voice_lessons_concurrently_and_stay_
     assert (c2["sub"], c2["video"]["room"]) == (f"student-{s2.id}", started2["room_name"])
     _, m1 = _dispatch(started1)
     _, m2 = _dispatch(started2)
-    assert (m1["session_id"], m1["lesson_prompt"], m1["lesson_title"]) == (started1["session_id"], "PROMPT-ONE", "Music")
-    assert (m2["session_id"], m2["lesson_prompt"], m2["lesson_title"]) == (started2["session_id"], "PROMPT-TWO", "Travel")
+    assert m1["session_id"] == started1["session_id"]
+    assert m1["lesson_prompt"] == wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", "PROMPT-ONE")
+    assert m1["lesson_title"] == "Music"
+    assert m2["session_id"] == started2["session_id"]
+    assert m2["lesson_prompt"] == wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", "PROMPT-TWO")
+    assert m2["lesson_title"] == "Travel"
 
     livekit.agent_joins(started1["room_name"])
     livekit.agent_joins(started2["room_name"])

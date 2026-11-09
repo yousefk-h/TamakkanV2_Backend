@@ -116,8 +116,12 @@ async def test_same_student_avatar_and_voice_are_completely_separate_and_run_con
     assert (a_agent, v_agent) == ("tamakkan-mariam-dev", "tamakkan-voice-dev")
     assert a_meta["session_id"] == avatar["session_id"] and v_meta["session_id"] == voice["session_id"]
     # Each agent only ever receives its own prompt: no prompt/metadata crossing.
-    assert a_meta["topic_instructions"] == "AVATAR-ONLY" and "lesson_prompt" not in a_meta
-    assert v_meta["lesson_prompt"] == "VOICE-ONLY" and "topic_instructions" not in v_meta
+    # Wrapped in an explicit "lesson reference material" boundary (see
+    # app.core.prompt_safety) rather than sent as the raw string.
+    assert "AVATAR-ONLY" in a_meta["topic_instructions"] and "lesson_prompt" not in a_meta
+    assert "VOICE-ONLY" not in a_meta["topic_instructions"]
+    assert "VOICE-ONLY" in v_meta["lesson_prompt"] and "topic_instructions" not in v_meta
+    assert "AVATAR-ONLY" not in v_meta["lesson_prompt"]
 
     # Both connect; neither start disturbed the other.
     assert _avatar_connected(client, avatar["session_id"]).json()["state"] == "connected"

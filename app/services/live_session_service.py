@@ -28,6 +28,7 @@ from loguru import logger
 from app.core.config import get_settings
 from app.core.learning_analytics import SCORE_FIELDS, comparison_for, has_enough_evidence, transcript_metrics, validate_feedback
 from app.core.entitlement import requester_may_open
+from app.core.prompt_safety import sanitize_untrusted_text, wrap_untrusted_lesson_content
 from app.core.exceptions import ConflictException, ForbiddenException, NotFoundException, ServiceUnavailableException, UnprocessableException
 from app.core.session_scoring import SessionScorer, SessionScoringError, SessionScoringNotConfigured, get_session_scorer
 from app.core.state_machine import InvalidTransition, transition
@@ -236,8 +237,17 @@ class LiveSessionService:
                 "topic_id": topic.id,
                 "max_duration_minutes": max_duration_minutes,
                 "lesson_title": topic.title,
-                "lesson_prompt": topic.voice_practice_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
-                "opening_line": topic.opening_line,
+                # Teacher-authored (possibly AI-drafted from an uploaded
+                # document) - never trusted as instructions. Wrapped in an
+                # explicit "lesson reference material" boundary before it
+                # ever reaches the hosted voice agent's template - see
+                # app.core.prompt_safety for why this exists alongside
+                # (not instead of) that agent's own prompt wording.
+                "lesson_prompt": wrap_untrusted_lesson_content(
+                    "TEACHER LESSON INSTRUCTIONS",
+                    topic.voice_practice_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
+                ),
+                "opening_line": sanitize_untrusted_text(topic.opening_line),
                 "level": delivery_level.value,
                 # Optional Jordanian-Arabic clarification support (teacher-
                 # controlled) - `None` means "legacy topic, predates this
@@ -262,9 +272,15 @@ class LiveSessionService:
                 "max_duration_minutes": max_duration_minutes,
                 # Handed to the agent directly so it never needs its own
                 # database read to build Mariam's instructions or opening
-                # line - see this module's docstring.
-                "topic_instructions": topic.avatar_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
-                "opening_line": topic.opening_line,
+                # line - see this module's docstring. Teacher-authored
+                # (possibly AI-drafted from an uploaded document), so it is
+                # wrapped in an explicit "lesson reference material, not
+                # instructions" boundary - see app.core.prompt_safety.
+                "topic_instructions": wrap_untrusted_lesson_content(
+                    "TOPIC INSTRUCTIONS",
+                    topic.avatar_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
+                ),
+                "opening_line": sanitize_untrusted_text(topic.opening_line),
                 "level": delivery_level.value,
                 # Same optional Jordanian-Arabic support as Voice Practice
                 # above - the Avatar agent never had any Arabic behavior
@@ -410,8 +426,8 @@ class LiveSessionService:
             "topic_id": topic.id,
             "max_duration_minutes": max_duration_minutes,
             "lesson_title": topic.title,
-            "lesson_prompt": topic.voice_practice_prompt,
-            "opening_line": topic.opening_line,
+            "lesson_prompt": wrap_untrusted_lesson_content("TEACHER LESSON INSTRUCTIONS", topic.voice_practice_prompt),
+            "opening_line": sanitize_untrusted_text(topic.opening_line),
             "level": topic.level.value,
             "arabic_support_enabled": topic.arabic_support_enabled,
             "arabic_intervention_level": topic.arabic_intervention_level.value,

@@ -17,7 +17,7 @@ from app.repositories.topic_content_repository import TopicContentRepository
 from app.services.progress_service import get_progress_service
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
 from app.services.exercise_draft_service import ExerciseDraftService, get_exercise_draft_service
-from app.schema.topic import LessonExerciseIn
+from app.schema.topic import LessonExerciseIn, TopicListItem
 from app.services.transcript_pipeline_service import (
     TranscriptPipelineService,
     get_transcript_pipeline_service,
@@ -987,11 +987,18 @@ async def test_the_topic_list_never_carries_transcripts(client):
     rows = client.get("/api/v1/topics", headers={"Authorization": f"Bearer {admin_token}"}).json()
 
     assert len(rows) == 1
-    assert set(rows[0]) == {
-            "id", "created_at", "updated_at", "title", "level", "level_profile_id", "level_name", "youtube_urls", "thumbnail_url",
-        "video_duration_seconds", "transcript_state", "lesson_status", "session_minutes", "created_by_id",
-        "unit_id", "order_index", "has_pdf",
-    }
+    # Derived from the schema itself (plus BaseSchema's id/created_at/
+    # updated_at) rather than a hand-maintained literal set, so a future
+    # field added to TopicListItem doesn't make this assertion stale again -
+    # see the prior hardcoded set, which failed this exact way once
+    # author_name/has_video/has_audio/exercise_count/exercise_kinds were
+    # added. The actual guarantee this test protects - no transcript text
+    # ever reaches a list row - is still asserted explicitly below,
+    # independent of whatever fields the schema happens to carry.
+    assert set(rows[0]) == set(TopicListItem.model_fields) | {"id", "created_at", "updated_at"}
+    assert "raw_transcript" not in rows[0]
+    assert "approved_transcript" not in rows[0]
+    assert "transcript" not in rows[0]
     assert "a" * 500 not in str(rows)
 
 
