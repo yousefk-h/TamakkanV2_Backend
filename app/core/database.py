@@ -27,6 +27,8 @@ from app.core.config import get_settings
 from app.models.alert_log import AlertLog
 from app.models.audit_log import AuditLog
 from app.models.calendar_template import CalendarTemplate
+from app.models.cohort import Cohort
+from app.models.enrollment import Enrollment
 from app.models.exercise_attempt import ExerciseAttempt
 from app.models.homework import Homework
 from app.models.level_profile import LevelProfile
@@ -35,6 +37,8 @@ from app.models.live_session import LiveSession
 from app.models.password_reset_request import PasswordResetRequest
 from app.models.password_reset_token import PasswordResetToken
 from app.models.platform_avatar_config import PlatformAvatarConfig
+from app.models.program import Program
+from app.models.program_topic import ProgramTopic
 from app.models.recording_submission import RecordingSubmission
 from app.models.refresh_token import RefreshToken
 from app.models.topic_content import TopicContent
@@ -62,6 +66,10 @@ DOCUMENT_MODELS: list = [
     ExerciseAttempt,
     Homework,
     LevelProfile,
+    Program,
+    ProgramTopic,
+    Cohort,
+    Enrollment,
 ]
 
 
