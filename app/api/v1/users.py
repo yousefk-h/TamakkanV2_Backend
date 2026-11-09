@@ -173,9 +173,9 @@ async def assign_plan(
     admin: User = Depends(require_teacher_or_administrator),
     service: UserService = Depends(get_user_service),
 ) -> UserPublic:
-    """Administrator only, and only for a Student you created. Standard sets
-    one `assigned_level` (their group's whole catalogue at that level); Pro
-    sets a hand-picked `assigned_topic_ids` list spanning any level.
+    """Assign access separately from curriculum. Standard enrolls the
+    student in one Program stage (legacy difficulty-only assignment remains
+    accepted); Pro assigns one explicit custom Calendar and no Program.
     """
     student = await service.assign_plan(student_id, admin, body)
     return UserPublic.from_user(student)

@@ -9,15 +9,19 @@ in the first place - entitlement is a Student concept.
 """
 
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from app.services.enrollment_service import EnrollmentContext
 
 from loguru import logger
 
 from app.core.exceptions import ForbiddenException, NotFoundException, UnprocessableException
 from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
-from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage
+from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage, get_lesson_audio_storage
 from app.core.youtube import fetch_video_duration_seconds
 from app.models.topic_content import TopicContent, TranscriptState
+from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.level_profile import LevelProfile
 from app.models.user import Role, User
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, TopicContentRepository
@@ -37,6 +41,8 @@ CLOUDINARY_THUMBNAIL_FOLDER = "Tamakkan/topic-thumbnails"
 # either - generous headroom over any real lesson document.
 MAX_PDF_UPLOAD_BYTES = 20 * 1024 * 1024
 CLOUDINARY_PDF_FOLDER = "Tamakkan/topic-pdfs"
+MAX_SOURCE_VIDEO_UPLOAD_BYTES = 80 * 1024 * 1024
+CLOUDINARY_SOURCE_VIDEO_FOLDER = "Tamakkan/topic-videos"
 
 
 class TopicContentService:
@@ -46,6 +52,7 @@ class TopicContentService:
         progress_service: ProgressService,
         image_storage: Optional[ImageStorage] = None,
         document_storage: Optional[DocumentStorage] = None,
+        video_storage=None,
         unit_repository: Optional[UnitRepository] = None,
         user_repository: Optional[UserRepository] = None,
     ) -> None:
@@ -53,8 +60,50 @@ class TopicContentService:
         self.progress_service = progress_service
         self.image_storage = image_storage or get_image_storage()
         self.document_storage = document_storage or get_document_storage()
+        self.video_storage = video_storage or get_lesson_audio_storage()
         self.unit_repository = unit_repository or UnitRepository()
         self.user_repository = user_repository or UserRepository()
+
+    async def _start_content_revision(self, topic: TopicContent) -> dict:
+        """Prepare an editable revision without changing what published
+        Program placements currently deliver.
+
+        Legacy published placements did not record a revision. Pin them to
+        the current document before the edit, then advance the library topic
+        to a new revision. Draft placements always follow the latest draft.
+        """
+        published = await ProgramTopic.find({
+            "topic_id": topic.id,
+            "status": ProgramTopicStatus.PUBLISHED.value,
+            "is_deleted": False,
+        }).to_list()
+        snapshots = list(topic.revision_snapshots)
+        if published and not any(item.revision == topic.content_revision for item in snapshots):
+            snapshots.append(topic.make_revision_snapshot())
+        for placement in published:
+            if placement.published_revision is None:
+                placement.published_revision = topic.content_revision
+                await placement.save()
+        return {
+            "content_revision": topic.content_revision + 1,
+            "revision_snapshots": snapshots,
+        }
+
+    async def _student_delivery_topic(self, topic: TopicContent, student: User) -> TopicContent:
+        """Return the revision explicitly published for this student's
+        Program. Legacy/custom calendars fall back to the current revision.
+        """
+        if not student.program_id:
+            return topic
+        placement = await ProgramTopic.find_one({
+            "program_id": student.program_id,
+            "topic_id": topic.id,
+            "status": ProgramTopicStatus.PUBLISHED.value,
+            "is_deleted": False,
+        })
+        if placement is None:
+            return topic
+        return topic.at_revision(placement.published_revision)
 
     async def _resolve_unit_id(self, unit_id: Optional[str], level, admin: User) -> Optional[str]:
         """Validates a client-given `unit_id` before it's ever trusted: the
@@ -97,9 +146,12 @@ class TopicContentService:
         limit: int = DEFAULT_PAGE_SIZE,
         skip: int = 0,
         owner_id: Optional[str] = None,
+        search: Optional[str] = None,
+        level=None,
     ) -> list[TopicContent]:
         return await self.topic_repository.list_all(
-            transcript_state=transcript_state, limit=limit, skip=skip, owner_id=owner_id
+            transcript_state=transcript_state, limit=limit, skip=skip, owner_id=owner_id,
+            search=search, level=level,
         )
 
     async def list_for_requester(
@@ -108,6 +160,8 @@ class TopicContentService:
         transcript_state: Optional[TranscriptState] = None,
         limit: int = DEFAULT_PAGE_SIZE,
         skip: int = 0,
+        search: Optional[str] = None,
+        level=None,
     ) -> list[tuple[TopicContent, Optional[LessonDayState], Optional[int]]]:
         """Root and Administrator (Center Admin) see every topic in the center, Administrator included since
         PROMPT-047. A Teacher sees only the topics *they* authored, plus legacy ones with no author recorded yet
@@ -123,7 +177,8 @@ class TopicContentService:
         if requester.role != Role.STUDENT:
             owner_id = None if requester.role in (Role.ROOT, Role.ADMINISTRATOR) else requester.id
             topics = await self.list_all(
-                transcript_state=transcript_state, limit=limit, skip=skip, owner_id=owner_id
+                transcript_state=transcript_state, limit=limit, skip=skip, owner_id=owner_id,
+                search=search, level=level,
             )
             return [(topic, None, None) for topic in topics]
 
@@ -132,7 +187,7 @@ class TopicContentService:
             return []
         topics_by_id = {t.id: t for t in await self.topic_repository.get_many_by_ids(topic_ids)}
         triples = [
-            (topics_by_id[tid], statuses.get(tid, LessonDayState.LOCKED), await self.progress_service.get_topic_session_minutes(requester, tid))
+            (await self._student_delivery_topic(topics_by_id[tid], requester), statuses.get(tid, LessonDayState.LOCKED), await self.progress_service.get_topic_session_minutes(requester, tid))
             for tid in topic_ids
             if tid in topics_by_id
         ]
@@ -147,7 +202,7 @@ class TopicContentService:
         return topic
 
     async def get_one_for_requester(
-        self, topic_id: str, requester: User
+        self, topic_id: str, requester: User, enrollment_context: Optional["EnrollmentContext"] = None
     ) -> tuple[TopicContent, Optional[LessonDayState], Optional[int]]:
         """The server-side half of card #14's reproduced hole: a Student
         must not be able to open a lesson outside their own calendar, or one
@@ -166,14 +221,20 @@ class TopicContentService:
             return topic, None, None
         if requester.role != Role.STUDENT:
             return topic, None, None
-        statuses = await self.progress_service.get_topic_statuses(requester)
+        if enrollment_context is not None:
+            statuses = await self.progress_service.get_topic_statuses_for_context(requester, enrollment_context)
+        else:
+            statuses = await self.progress_service.get_topic_statuses(requester)
         status = statuses.get(topic_id)
         if status is None:
             raise ForbiddenException("This topic is not part of your assigned plan")
         if status == LessonDayState.LOCKED:
             raise ForbiddenException("This lesson hasn't unlocked yet")
-        minutes = await self.progress_service.get_topic_session_minutes(requester, topic_id)
-        return topic, status, minutes
+        if enrollment_context is not None:
+            minutes = await self.progress_service.get_topic_session_minutes_for_context(requester, topic_id, enrollment_context)
+        else:
+            minutes = await self.progress_service.get_topic_session_minutes(requester, topic_id)
+        return await self._student_delivery_topic(topic, requester), status, minutes
 
     async def get_own_topic(self, topic_id: str, admin: User) -> TopicContent:
         """The Teacher write-path ownership gate (teacher isolation): a
@@ -261,6 +322,7 @@ class TopicContentService:
                 changes["unit_id"], changes.get("level", topic.level), admin
             )
         if changes:
+            changes.update(await self._start_content_revision(topic))
             await self.topic_repository.update_fields(topic_id, changes)
         return await self.get_one(topic_id)
 
@@ -287,9 +349,10 @@ class TopicContentService:
             raise UnprocessableException(f"Could not upload image: {exc}") from exc
 
         previous_public_id = topic.custom_thumbnail_public_id
+        revision = await self._start_content_revision(topic)
         await self.topic_repository.update_fields(
             topic_id,
-            {"custom_thumbnail_url": result.secure_url, "custom_thumbnail_public_id": result.public_id},
+            {"custom_thumbnail_url": result.secure_url, "custom_thumbnail_public_id": result.public_id, **revision},
         )
         if previous_public_id:
             await self._delete_thumbnail_asset(previous_public_id)
@@ -322,6 +385,7 @@ class TopicContentService:
             raise UnprocessableException(f"Could not upload PDF: {exc}") from exc
 
         previous_public_id = topic.pdf_public_id
+        revision = await self._start_content_revision(topic)
         await self.topic_repository.update_fields(
             topic_id,
             {
@@ -329,19 +393,94 @@ class TopicContentService:
                 "pdf_public_id": result.public_id,
                 "pdf_filename": filename,
                 "pdf_extracted_text": extracted_text,
+                "transcript_state": TranscriptState.QUEUED,
+                "transcript_state_started_at": None,
+                "raw_transcript": [],
+                "transcript_source_labels": [],
+                "transcript_source": None,
+                "approved_transcript": None,
+                **revision,
             },
         )
         if previous_public_id:
             await self._delete_pdf_asset(previous_public_id)
         return await self.get_one(topic_id)
 
+    async def upload_source_video(self, topic_id: str, file_bytes: bytes, content_type: str, filename: str, admin: User) -> TopicContent:
+        allowed = {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+        if content_type not in allowed:
+            raise UnprocessableException("Use an MP4, WebM, MOV or MKV lesson video")
+        if not file_bytes or len(file_bytes) > MAX_SOURCE_VIDEO_UPLOAD_BYTES:
+            raise UnprocessableException("Video is empty or larger than 80 MB")
+        topic = await self.get_own_topic(topic_id, admin)
+        public_id = f"{CLOUDINARY_SOURCE_VIDEO_FOLDER}/{topic_id}-{uuid.uuid4().hex}"
+        try:
+            result = await self.video_storage.upload(file_bytes, public_id)
+        except UploadFailedError as exc:
+            raise UnprocessableException(f"Could not upload video: {exc}") from exc
+        previous = topic.uploaded_video_public_id
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "uploaded_video_url": result.secure_url,
+            "uploaded_video_public_id": result.public_id,
+            "uploaded_video_filename": filename,
+            "transcript_state": TranscriptState.QUEUED,
+            "transcript_state_started_at": None,
+            "raw_transcript": [],
+            "transcript_source_labels": [],
+            "transcript_source": None,
+            "approved_transcript": None,
+            **revision,
+        })
+        if previous:
+            try:
+                await self.video_storage.delete(previous)
+            except UploadFailedError:
+                logger.warning("Could not delete replaced lesson video {}", previous)
+        return await self.get_one(topic_id)
+
+    async def remove_source_video(self, topic_id: str, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "uploaded_video_url": None,
+            "uploaded_video_public_id": None,
+            "uploaded_video_filename": None,
+            "transcript_state": TranscriptState.QUEUED,
+            "transcript_state_started_at": None,
+            "raw_transcript": [],
+            "transcript_source_labels": [],
+            "transcript_source": None,
+            "approved_transcript": None,
+            **revision,
+        })
+        if topic.uploaded_video_public_id:
+            try:
+                await self.video_storage.delete(topic.uploaded_video_public_id)
+            except UploadFailedError:
+                logger.warning("Could not delete lesson video {}", topic.uploaded_video_public_id)
+        return await self.get_one(topic_id)
+
     async def remove_pdf(self, topic_id: str, admin: User) -> TopicContent:
         topic = await self.get_own_topic(topic_id, admin)
+        revision = await self._start_content_revision(topic)
         if topic.pdf_public_id:
             await self._delete_pdf_asset(topic.pdf_public_id)
         await self.topic_repository.update_fields(
             topic_id,
-            {"pdf_url": None, "pdf_public_id": None, "pdf_filename": None, "pdf_extracted_text": None},
+            {
+                "pdf_url": None,
+                "pdf_public_id": None,
+                "pdf_filename": None,
+                "pdf_extracted_text": None,
+                "transcript_state": TranscriptState.QUEUED,
+                "transcript_state_started_at": None,
+                "raw_transcript": [],
+                "transcript_source_labels": [],
+                "transcript_source": None,
+                "approved_transcript": None,
+                **revision,
+            },
         )
         return await self.get_one(topic_id)
 
@@ -358,8 +497,9 @@ class TopicContentService:
         topic = await self.get_own_topic(topic_id, admin)
         if topic.custom_thumbnail_public_id:
             await self._delete_thumbnail_asset(topic.custom_thumbnail_public_id)
+        revision = await self._start_content_revision(topic)
         await self.topic_repository.update_fields(
-            topic_id, {"custom_thumbnail_url": None, "custom_thumbnail_public_id": None}
+            topic_id, {"custom_thumbnail_url": None, "custom_thumbnail_public_id": None, **revision}
         )
         return await self.get_one(topic_id)
 

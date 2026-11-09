@@ -105,6 +105,17 @@ class LiveSession(BaseDocument):
     student_id: Annotated[str, Indexed()]
     topic: Optional[Link[TopicContent]] = None
     topic_id: Annotated[Optional[str], Indexed()] = None
+    # Enrollment context at session start. Optional preserves legacy rows.
+    program_id: Optional[str] = None
+    program_level_id: Optional[str] = None
+    # Which specific Enrollment this session was opened under, when one was
+    # resolved - see `EnrollmentService.resolve_context`. `None` for every
+    # pre-existing session and for any student with no Enrollment at all
+    # (program_id/program_level_id above remain the legacy fallback either
+    # way). Lets two enrollments that happen to share the same
+    # program_id/program_level_id (e.g. two Cohorts of one Program) still
+    # keep independent progress/session history.
+    enrollment_id: Annotated[Optional[str], Indexed()] = None
     livekit_room_name: str = ""
     mode: PracticeMode = PracticeMode.TOPIC_DISCUSSION
     # Snapshot the level for later comparisons even if the lesson is edited.

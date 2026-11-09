@@ -10,12 +10,13 @@ pipeline's state (captions or the Gemini fallback, see the platform plan §6).
 
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from beanie import Indexed
 from pydantic import BaseModel, Field
 
 from app.models.base import BaseDocument
+from app.utils.time import utcnow
 
 
 class Level(str, Enum):
@@ -59,6 +60,9 @@ class TranscriptSource(str, Enum):
 
     CAPTIONS = "captions"
     AI_GENERATED = "ai_generated"
+    LOCAL_ASR = "local_asr"
+    EXTRACTED_TEXT = "extracted_text"
+    MIXED = "mixed"
 
 
 TRANSCRIPT_TRANSITIONS: dict[TranscriptState, set[TranscriptState]] = {
@@ -141,11 +145,25 @@ class LessonExercise(BaseModel):
     audio_url: str = ""
     pairs: list[ExercisePair] = Field(default_factory=list)
     min_words: int = 0
+    # Submission policy is part of the authored lesson, so it travels with a
+    # pinned Topic revision and cannot be bypassed by a client-side checkbox.
+    allow_resubmit: bool = True
+    deadline_at: Optional[datetime] = None
+
+
+class TopicRevisionSnapshot(BaseModel):
+    revision: int
+    created_at: datetime
+    content: dict[str, Any]
 
 
 class TopicContent(BaseDocument):
     title: str
+    # Legacy/default difficulty for library filtering and unplaced topics.
+    # Program delivery resolves the mapped ProgramLevel difficulty instead.
     level: Level
+    content_revision: int = 1
+    revision_snapshots: list[TopicRevisionSnapshot] = Field(default_factory=list)
     level_profile_id: Optional[str] = None
     level_name: str = ""
     level_guidance: str = ""
@@ -163,6 +181,11 @@ class TopicContent(BaseDocument):
     # if there's no video, no API key configured, or the lookup failed.
     # Purely informational (a "video length" badge); nothing enforces it.
     video_duration_seconds: Optional[int] = None
+    # Teacher-uploaded source video. Public delivery is intentional: this is
+    # lesson material students must be able to watch, never student media.
+    uploaded_video_url: Optional[str] = None
+    uploaded_video_public_id: Optional[str] = None
+    uploaded_video_filename: Optional[str] = None
 
     # Video-optional lesson source (card #16): an uploaded PDF document a
     # teacher can ground a lesson in instead of, or alongside, a video. Same
@@ -202,6 +225,11 @@ class TopicContent(BaseDocument):
     # `None` in every other state.
     transcript_state_started_at: Optional[datetime] = None
     raw_transcript: list[TranscriptSegment] = Field(default_factory=list)
+    # Parallel to `raw_transcript`: a short human-readable origin label for
+    # each segment. Keeping labels separate preserves caption text verbatim
+    # while allowing the review UI and downstream AI input to show clear
+    # source boundaries when a lesson combines video and documents.
+    transcript_source_labels: list[str] = Field(default_factory=list)
     # Set alongside `raw_transcript` when a run completes - `None` until the
     # first one does. See `TranscriptSource`.
     transcript_source: Optional[TranscriptSource] = None
@@ -249,6 +277,27 @@ class TopicContent(BaseDocument):
     # `fetch()` returns the Link itself rather than `None` for a dangling
     # target.
     created_by_id: Annotated[Optional[str], Indexed()] = None
+
+    def make_revision_snapshot(self) -> TopicRevisionSnapshot:
+        return TopicRevisionSnapshot(
+            revision=self.content_revision,
+            created_at=utcnow(),
+            content=self.model_dump(exclude={"revision_snapshots"}),
+        )
+
+    def at_revision(self, revision: int | None) -> "TopicContent":
+        if revision is None or revision == self.content_revision:
+            return self
+        snapshot = next((item for item in self.revision_snapshots if item.revision == revision), None)
+        if snapshot is None:
+            return self
+        # Re-validate nested exercises/transcript models; `model_copy(update=)`
+        # deliberately skips validation and would leave nested model dumps as
+        # plain dictionaries in student/API and agent paths.
+        return self.__class__.model_validate({
+            **snapshot.content,
+            "revision_snapshots": self.revision_snapshots,
+        })
 
     @property
     def voice_practice_prompt(self) -> str:

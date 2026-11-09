@@ -15,6 +15,7 @@ from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.live_session_repository import LiveSessionRepository
 from app.repositories.topic_content_repository import TopicContentRepository
 from app.repositories.user_repository import UserRepository
+from app.services.enrollment_service import get_enrollment_service
 from app.services.live_session_service import LiveSessionService
 from app.services.progress_service import get_progress_service
 from app.utils.time import utcnow
@@ -48,7 +49,7 @@ class Scorer:
 
 def service(scorer):
     return LiveSessionService(LiveSessionRepository(), TopicContentRepository(), UserRepository(),
-                              AuditLogRepository(), scorer, get_progress_service())
+                              AuditLogRepository(), scorer, get_progress_service(), get_enrollment_service())
 
 
 async def session_fixture():

@@ -81,6 +81,35 @@ async def test_administrator_can_create_a_topic(client):
     assert body["youtube_urls"] == TOPIC_PAYLOAD["youtube_urls"]
 
 
+async def test_topic_library_search_returns_bounded_card_metadata(client):
+    token = await _login(client, Role.TEACHER, "library-search@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    matching = client.post("/api/v1/topics", json={
+        "title": "At the pharmacy",
+        "level": "intermediate",
+        "youtube_urls": ["https://youtube.com/watch?v=abc123"],
+        "lesson_exercises": [
+            {"kind": "listening", "prompt": "Which medicine did Mariam request?", "content": "Mariam asks for medicine.", "audio_url": "https://example.com/audio.mp3", "options": ["Tea", "Medicine"], "correct_option": 1},
+            {"kind": "speaking", "prompt": "Ask the pharmacist for help"},
+        ],
+    }, headers=headers)
+    assert matching.status_code == 200, matching.text
+    client.post("/api/v1/topics", json={"title": "Daily routine", "level": "beginner"}, headers=headers)
+
+    response = client.get("/api/v1/topics", params={
+        "search": "medicine", "level": "intermediate", "limit": 1, "skip": 0,
+    }, headers=headers)
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    card = response.json()[0]
+    assert card["id"] == matching.json()["id"]
+    assert card["author_name"] == "Test User"
+    assert card["has_video"] is True
+    assert card["has_audio"] is True
+    assert card["exercise_count"] == 2
+    assert card["exercise_kinds"] == ["listening", "speaking"]
+
+
 async def test_teacher_can_author_and_reorder_lesson_exercises(client):
     token = await _login(client, Role.TEACHER, "exercise-teacher@example.com")
     headers = {"Authorization": f"Bearer {token}"}

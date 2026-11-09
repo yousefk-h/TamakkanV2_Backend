@@ -32,6 +32,7 @@ from app.core.exceptions import ConflictException, ForbiddenException, NotFoundE
 from app.core.session_scoring import SessionScorer, SessionScoringError, SessionScoringNotConfigured, get_session_scorer
 from app.core.state_machine import InvalidTransition, transition
 from app.models.audit_log import AuditLog
+from app.models.level_profile import LevelProfile
 from app.models.live_session import (
     SESSION_TRANSITIONS,
     EndReason,
@@ -42,12 +43,14 @@ from app.models.live_session import (
     SpeakingReport,
 )
 from app.models.user import Role, User
+from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.learning_analysis import LearningAnalysis
 from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.live_session_repository import LiveSessionRepository
 from app.repositories.topic_content_repository import TopicContentRepository
 from app.repositories.user_repository import UserRepository
 from app.schema.live_session import SessionStartResponse
+from app.services.enrollment_service import EnrollmentContext, EnrollmentService, get_enrollment_service
 from app.services.progress_service import ProgressService, get_progress_service
 from app.utils.time import utcnow
 
@@ -120,6 +123,7 @@ class LiveSessionService:
         audit_log_repository: AuditLogRepository,
         session_scorer: SessionScorer,
         progress_service: ProgressService,
+        enrollment_service: EnrollmentService,
     ) -> None:
         self.session_repository = session_repository
         self.topic_repository = topic_repository
@@ -127,6 +131,7 @@ class LiveSessionService:
         self.user_repository = user_repository
         self.audit_log_repository = audit_log_repository
         self.session_scorer = session_scorer
+        self.enrollment_service = enrollment_service
 
     async def start_session(
         self,
@@ -136,15 +141,49 @@ class LiveSessionService:
         *,
         continuation_context: Optional[dict] = None,
         handoff_source_session_id: Optional[str] = None,
+        enrollment_id: Optional[str] = None,
     ) -> SessionStartResponse:
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None:
             raise NotFoundException("Topic not found")
+        # Resolves which Enrollment this session opens under - explicit
+        # `enrollment_id` (e.g. carried over from the source session on a
+        # handoff), the student's one unambiguous active Enrollment, or the
+        # legacy `student.program_id`/`program_level_id` fallback when no
+        # Enrollment exists at all. Raises if the student has several active
+        # enrollments and didn't say which one - never silently picks one.
+        context = await self.enrollment_service.resolve_context(student, enrollment_id)
         # Same write-side entitlement gate as `RecordingSubmissionService
         # .submit_audio` - a topic-tied Mariam session is a write into that
         # topic's content the same way a submission is.
-        if not await requester_may_open(student, topic_id, self.progress_service):
+        if not await requester_may_open(student, topic_id, self.progress_service, context):
             raise ForbiddenException("This topic is not part of your assigned plan, or hasn't unlocked yet")
+
+        # Program placement, not the Topic Library's legacy/default level,
+        # defines delivery. The published revision remains stable until an
+        # explicit re-publish action pins the latest library revision.
+        delivery_level = topic.level
+        delivery_level_name = topic.level_name
+        delivery_guidance = topic.level_guidance
+        if context.program_id:
+            placement = await ProgramTopic.find_one({
+                "program_id": context.program_id,
+                "topic_id": topic.id,
+                "status": ProgramTopicStatus.PUBLISHED.value,
+                "is_deleted": False,
+            })
+            if placement is not None:
+                topic = topic.at_revision(placement.published_revision)
+                delivery_level = placement.level
+                if placement.level_profile_id:
+                    profile = await LevelProfile.find_one({
+                        "_id": placement.level_profile_id,
+                        "is_deleted": False,
+                        "is_active": True,
+                    })
+                    if profile is not None:
+                        delivery_level_name = profile.name
+                        delivery_guidance = profile.avatar_guidance
 
         settings = get_settings()
         required = ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]
@@ -169,8 +208,11 @@ class LiveSessionService:
             student_id=student.id,
             topic=topic,
             topic_id=topic.id,
+            program_id=context.program_id,
+            program_level_id=context.program_level_id,
+            enrollment_id=context.enrollment.id if context.enrollment else None,
             mode=mode,
-            assessment_level=topic.level.value,
+            assessment_level=delivery_level.value,
             state=self._advance(SessionState.NOT_STARTED, SessionState.CONNECTING),
             handoff_source_session_id=handoff_source_session_id,
             continuation_context=continuation_context,
@@ -181,7 +223,7 @@ class LiveSessionService:
         session.livekit_room_name = room_name
         await self.session_repository.save(session)
 
-        max_duration_minutes = await self.progress_service.get_topic_session_minutes(student, topic_id)
+        max_duration_minutes = await self.progress_service.get_topic_session_minutes_for_context(student, topic_id, context)
         if mode == PracticeMode.VOICE_PRACTICE:
             agent_name = settings.LIVEKIT_VOICE_AGENT_NAME
             # Flat string/number values only: Agent Builder exposes each
@@ -194,9 +236,9 @@ class LiveSessionService:
                 "topic_id": topic.id,
                 "max_duration_minutes": max_duration_minutes,
                 "lesson_title": topic.title,
-                "lesson_prompt": topic.voice_practice_prompt + (f"\n\nCenter level guidance ({topic.level_name}): {topic.level_guidance}" if topic.level_guidance else ""),
+                "lesson_prompt": topic.voice_practice_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
                 "opening_line": topic.opening_line,
-                "level": topic.level.value,
+                "level": delivery_level.value,
                 # Optional Jordanian-Arabic clarification support (teacher-
                 # controlled) - `None` means "legacy topic, predates this
                 # field", which the voice agent treats as its own old,
@@ -221,9 +263,9 @@ class LiveSessionService:
                 # Handed to the agent directly so it never needs its own
                 # database read to build Mariam's instructions or opening
                 # line - see this module's docstring.
-                "topic_instructions": topic.avatar_prompt + (f"\n\nCenter level guidance ({topic.level_name}): {topic.level_guidance}" if topic.level_guidance else ""),
+                "topic_instructions": topic.avatar_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
                 "opening_line": topic.opening_line,
-                "level": topic.level.value,
+                "level": delivery_level.value,
                 # Same optional Jordanian-Arabic support as Voice Practice
                 # above - the Avatar agent never had any Arabic behavior
                 # before this, so `None`/`False` are equivalent for it.
@@ -323,6 +365,12 @@ class LiveSessionService:
             PracticeMode.VOICE_PRACTICE,
             continuation_context=continuation_context,
             handoff_source_session_id=source.id,
+            # Carries the SOURCE session's own resolved enrollment forward
+            # rather than re-resolving - a handoff must never switch
+            # enrollment context mid-conversation, even if the student holds
+            # several active enrollments. `None` for a legacy source session
+            # (every pre-existing one) preserves the old fallback behavior.
+            enrollment_id=source.enrollment_id,
         )
 
         # Only written once the target is confirmed created and saved above - a failure there raises before this
@@ -346,7 +394,16 @@ class LiveSessionService:
         student = await self.user_repository.get_by_id(target.student_id)
         if student is None:
             raise NotFoundException("Student not found")
-        max_duration_minutes = await self.progress_service.get_topic_session_minutes(student, target.topic_id)
+        # Resolved from the TARGET session's own stamped context, never
+        # re-derived from the student's CURRENT active enrollments - a student
+        # who has since gained a second enrollment must not turn re-minting a
+        # token for an existing (possibly legacy) session into an
+        # ambiguous-enrollment error.
+        if target.enrollment_id:
+            context = await self.enrollment_service.resolve_context(student, target.enrollment_id)
+        else:
+            context = EnrollmentContext(None, target.program_id, target.program_level_id, None)
+        max_duration_minutes = await self.progress_service.get_topic_session_minutes_for_context(student, target.topic_id, context)
         metadata = {
             "project": "tamakkan",
             "session_id": target.id,
@@ -846,4 +903,5 @@ def get_live_session_service() -> LiveSessionService:
         AuditLogRepository(),
         get_session_scorer(),
         get_progress_service(),
+        get_enrollment_service(),
     )

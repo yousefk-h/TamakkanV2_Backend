@@ -11,10 +11,14 @@ mirrors the "no speculative flexibility" choice already made for
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from app.services.enrollment_service import EnrollmentContext
 
 from app.core.challenge import CHALLENGE_TOTAL_DAYS, END_OF_WEEK_CHECKIN_DAYS
 from app.models.calendar_template import CalendarTemplate, TemplateKind
+from app.models.cohort import Cohort
 from app.models.live_session import LiveSession, SessionState
 from app.models.recording_submission import RecordingSubmission
 from app.models.topic_content import TopicContent
@@ -109,7 +113,7 @@ def _first_vocab_threshold_crossing(
     return crossed_at, total
 
 
-def _program_today(start_date: Optional[datetime]) -> int:
+def _program_today(start_date: Optional[datetime], total_days: int = CHALLENGE_TOTAL_DAYS) -> int:
     """1-based, capped to `CHALLENGE_TOTAL_DAYS`, anchored to the date the
     assigning admin set as "day 1" (`User.program_start_date`) - not the
     student's own first activity. A teacher-chosen start date is a
@@ -125,7 +129,7 @@ def _program_today(start_date: Optional[datetime]) -> int:
     """
     if start_date is None:
         return 0
-    return max(0, min(CHALLENGE_TOTAL_DAYS, (utcnow().date() - start_date.date()).days + 1))
+    return max(0, min(total_days, (utcnow().date() - start_date.date()).days + 1))
 
 
 def _had_a_real_conversation(session: LiveSession) -> bool:
@@ -166,19 +170,21 @@ def _build_schedule(
     entry if the backlog is empty) - not a commitment about what will
     actually land there once earlier days are resolved.
     """
-    if template is None or not template.days:
+    if template is None:
         return ChallengeCalendar(lesson_days=[], pending_count=0, has_template=False)
+    if not template.days:
+        return ChallengeCalendar(lesson_days=[], pending_count=0, has_template=True, total_days=template.duration_days, rest_days=template.rest_days)
     base_assignment: dict[int, list[str]] = {entry.day: entry.topic_ids for entry in template.days}
 
     ended = [s for s in sessions if s.state == SessionState.ENDED and s.ended_at is not None]
     completed_topic_ids = {s.topic_id for s in ended if s.topic_id and _had_a_real_conversation(s)}
-    today = _program_today(start_date)
+    today = _program_today(start_date, template.duration_days)
 
     lesson_days: list[LessonDaySlot] = []
     pending_count = 0
     backlog: deque[str] = deque()
-    for day in range(1, CHALLENGE_TOTAL_DAYS + 1):
-        if day in END_OF_WEEK_CHECKIN_DAYS:
+    for day in range(1, template.duration_days + 1):
+        if day in template.rest_days:
             continue
         days_new_topic_ids = base_assignment.get(day, [])
 
@@ -204,10 +210,24 @@ def _build_schedule(
         backlog = still_owed
         lesson_days.append(LessonDaySlot(day=day, topics=slots))
 
-    return ChallengeCalendar(lesson_days=lesson_days, pending_count=pending_count)
+    return ChallengeCalendar(lesson_days=lesson_days, pending_count=pending_count, total_days=template.duration_days, rest_days=template.rest_days)
 
 
 _STATUS_PRECEDENCE = {LessonDayState.LOCKED: 0, LessonDayState.MISSED: 1, LessonDayState.CURRENT: 2, LessonDayState.DONE: 3}
+
+
+def _for_current_enrollment(student: User, records: list) -> list:
+    """Keep progress writes from the student's current Program/stage.
+    Rows created before enrollment context existed remain readable as legacy
+    history, preserving historical data during migration."""
+    return [
+        record for record in records
+        if getattr(record, "program_id", None) is None
+        or (
+            getattr(record, "program_id", None) == student.program_id
+            and getattr(record, "program_level_id", None) in (None, student.program_level_id)
+        )
+    ]
 
 
 def resolve_topic_statuses(schedule: ChallengeCalendar) -> dict[str, LessonDayState]:
@@ -238,9 +258,11 @@ def _build_alerts(
     already-fetched-rows shape as `_build_schedule`, for the same reason.
     """
     schedule = _build_schedule(template, sessions, start_date)
-    today = _program_today(start_date)
+    total_days = template.duration_days if template else CHALLENGE_TOTAL_DAYS
+    checkin_days = set(template.rest_days) if template else END_OF_WEEK_CHECKIN_DAYS
+    today = _program_today(start_date, total_days)
     submitted_days = {sub.day for sub in submissions if sub.day is not None}
-    missed_submission_days = sorted(d for d in END_OF_WEEK_CHECKIN_DAYS if d < today and d not in submitted_days)
+    missed_submission_days = sorted(d for d in checkin_days if d < today and d not in submitted_days)
     return StudentAlerts(
         pending_rollover_count=schedule.pending_count,
         missed_submission_days=missed_submission_days,
@@ -306,7 +328,7 @@ class ProgressService:
         vocab_crossed_at, _ = _first_vocab_threshold_crossing(ended, topics_by_id)
         top_scorer = next((s for s in reported if s.report and s.report.overall_score >= TOP_SCORER_MIN_SCORE), None)
         fast_improver_at = _first_fast_improvement(reported)
-        level_complete_at = await self._level_complete_at(student, ended)
+        level_complete_at = await self._level_complete_at(student, _for_current_enrollment(student, ended))
 
         badges = [
             Badge(key=BadgeKey.FIRST_CLASS, earned=bool(ended), earned_at=ended[0].started_at if ended else None),
@@ -323,7 +345,9 @@ class ProgressService:
             Badge(key=BadgeKey.LEVEL_COMPLETE, earned=level_complete_at is not None, earned_at=level_complete_at),
         ]
 
-        challenge_day = _program_today(student.program_start_date)
+        template = await self._resolve_template(student)
+        total_days = template.duration_days if template else CHALLENGE_TOTAL_DAYS
+        challenge_day = _program_today(student.program_start_date, total_days)
         milestones = [ChallengeMilestone(day=d, reached=challenge_day >= d) for d in CHALLENGE_MILESTONE_DAYS]
 
         today = utcnow().date()
@@ -335,7 +359,7 @@ class ProgressService:
             longest_streak=streaks.longest,
             total_active_days=len(active_dates),
             challenge_day=challenge_day,
-            challenge_total_days=CHALLENGE_TOTAL_DAYS,
+            challenge_total_days=total_days,
             program_start_date=student.program_start_date.date() if student.program_start_date else None,
             last_7_days_active=last_7_days_active,
             last_7_days_dates=[today - timedelta(days=offset) for offset in range(6, -1, -1)],
@@ -351,7 +375,21 @@ class ProgressService:
         nobody has set one up yet.
         """
         if student.plan == PlanType.STANDARD:
-            if student.assigned_level is None or student.created_by_id is None:
+            if student.assigned_level is None:
+                return None
+            if student.program_id:
+                if student.program_level_id:
+                    program_level_template = await self.calendar_template_repository.get_active_standard_for_program_level(
+                        student.program_id, student.program_level_id
+                    )
+                    if program_level_template is not None:
+                        return program_level_template
+                program_template = await self.calendar_template_repository.get_active_standard_for_program(
+                    student.program_id, student.assigned_level
+                )
+                if program_template is not None:
+                    return program_template
+            if student.created_by_id is None:
                 return None
             return await self.calendar_template_repository.get_active_standard(student.created_by_id, student.assigned_level)
         if student.plan == PlanType.PRO:
@@ -359,6 +397,21 @@ class ProgressService:
                 return None
             return await self.calendar_template_repository.get_by_id(student.assigned_plan_template_id)
         return None
+
+    @staticmethod
+    def _minutes_from_template(template: Optional[CalendarTemplate], daily_budget: int, topic_id: str) -> int:
+        if template is None:
+            return daily_budget
+        entry = next((e for e in template.days if topic_id in e.topic_ids), None)
+        if entry is None:
+            return daily_budget
+        if topic_id in entry.custom_minutes:
+            return entry.custom_minutes[topic_id]
+        automatic_ids = [tid for tid in entry.topic_ids if tid not in entry.custom_minutes]
+        if not automatic_ids:
+            return daily_budget
+        remaining = daily_budget - sum(entry.custom_minutes.values())
+        return max(1, remaining // len(automatic_ids))
 
     async def get_topic_session_minutes(self, student: User, topic_id: str) -> int:
         """How many minutes this student's next Mariam session for
@@ -374,18 +427,24 @@ class ProgressService:
         """
         daily_budget = student.duration_override_minutes or student.max_session_duration_minutes
         template = await self._resolve_template(student)
-        if template is None:
-            return daily_budget
-        entry = next((e for e in template.days if topic_id in e.topic_ids), None)
-        if entry is None:
-            return daily_budget
-        if topic_id in entry.custom_minutes:
-            return entry.custom_minutes[topic_id]
-        automatic_ids = [tid for tid in entry.topic_ids if tid not in entry.custom_minutes]
-        if not automatic_ids:
-            return daily_budget
-        remaining = daily_budget - sum(entry.custom_minutes.values())
-        return max(1, remaining // len(automatic_ids))
+        return self._minutes_from_template(template, daily_budget, topic_id)
+
+    async def get_topic_session_minutes_for_context(self, student: User, topic_id: str, context: "EnrollmentContext") -> int:
+        """Enrollment-aware counterpart to `get_topic_session_minutes` - looks
+        up the Cohort/Program stage's own effective schedule
+        (`CalendarTemplateRepository.get_effective_schedule`) instead of the
+        student's single legacy calendar. Falls straight through to the
+        legacy computation when `context.enrollment is None` (no Enrollment
+        exists for this student at all) - zero behavior change there.
+        """
+        daily_budget = student.duration_override_minutes or student.max_session_duration_minutes
+        if context.enrollment is None:
+            template = await self._resolve_template(student)
+        else:
+            template = await self.calendar_template_repository.get_effective_schedule(
+                context.program_id, context.program_level_id, context.cohort_id
+            )
+        return self._minutes_from_template(template, daily_budget, topic_id)
 
     async def get_lesson_schedule(self, student: User) -> ChallengeCalendar:
         """The student's own day-by-day calendar, taken directly from their
@@ -395,7 +454,7 @@ class ProgressService:
         nothing to schedule at all.
         """
         template = await self._resolve_template(student)
-        sessions = await self.session_repository.get_all_for_student(student.id)
+        sessions = _for_current_enrollment(student, await self.session_repository.get_all_for_student(student.id))
         return _build_schedule(template, sessions, student.program_start_date)
 
     async def get_topic_statuses(self, student: User) -> dict[str, LessonDayState]:
@@ -403,6 +462,44 @@ class ProgressService:
         `resolve_topic_statuses` for the actual precedence logic.
         """
         return resolve_topic_statuses(await self.get_lesson_schedule(student))
+
+    async def get_topic_statuses_for_context(self, student: User, context: "EnrollmentContext") -> dict[str, LessonDayState]:
+        """Enrollment-aware counterpart to `get_topic_statuses`, used when a
+        caller (session start, exercise submission, topic read) resolved an
+        explicit `EnrollmentContext` - see `EnrollmentService.resolve_context`.
+        `context.enrollment is None` means "no Enrollment exists for this
+        student at all" (never migrated / center hasn't adopted Cohorts), so
+        this falls straight through to the exact legacy computation above -
+        zero behavior change for any account that predates Enrollments.
+
+        When there IS a resolved enrollment, the schedule/session filtering
+        both key off that specific enrollment's `(program_id, program_level_id,
+        cohort_id)` rather than the student's single scalar assignment, so a
+        student enrolled in two Programs (or two Cohorts of the same Program)
+        gets independent, non-leaking statuses per enrollment.
+        """
+        if context.enrollment is None:
+            return await self.get_topic_statuses(student)
+        template = await self.calendar_template_repository.get_effective_schedule(
+            context.program_id, context.program_level_id, context.cohort_id
+        )
+        all_sessions = await self.session_repository.get_all_for_student(student.id)
+        sessions = [
+            s for s in all_sessions
+            if s.enrollment_id == context.enrollment.id
+            or (
+                context.legacy_attributable
+                and s.enrollment_id is None
+                and s.program_id == context.program_id
+                and s.program_level_id == context.program_level_id
+            )
+        ]
+        cohort = await Cohort.find_one({"_id": context.cohort_id}) if context.cohort_id else None
+        from app.services.enrollment_service import EnrollmentService  # local import avoids a module cycle at import time
+
+        anchor = EnrollmentService.schedule_anchor_date(context.enrollment, cohort)
+        schedule = _build_schedule(template, sessions, anchor)
+        return resolve_topic_statuses(schedule)
 
     async def get_calendar_topics_and_statuses(self, student: User) -> tuple[list[str], dict[str, LessonDayState]]:
         """Every topic anywhere in the student's own calendar, in day order,
@@ -434,8 +531,8 @@ class ProgressService:
         detail page's own "Alerts" section.
         """
         template = await self._resolve_template(student)
-        sessions = await self.session_repository.get_all_for_student(student.id)
-        submissions = await self.submission_repository.get_all_for_student(student.id)
+        sessions = _for_current_enrollment(student, await self.session_repository.get_all_for_student(student.id))
+        submissions = _for_current_enrollment(student, await self.submission_repository.get_all_for_student(student.id))
         return _build_alerts(template, sessions, submissions, student.program_start_date)
 
     async def get_alerts_for_students(self, students: list[User]) -> dict[str, StudentAlerts]:
@@ -470,17 +567,44 @@ class ProgressService:
         # Pro: one batch fetch of every distinct assigned template.
         pro_template_ids = list({s.assigned_plan_template_id for s in students if s.assigned_plan_template_id})
         pro_templates_by_id = {t.id: t for t in await self.calendar_template_repository.get_many_by_ids(pro_template_ids)}
+        program_template_by_program_and_level: dict[tuple[str, str], CalendarTemplate] = {}
+        program_template_by_stage: dict[tuple[str, str], CalendarTemplate] = {}
+        for program_id, program_level_id in {
+            (s.program_id, s.program_level_id)
+            for s in students
+            if s.plan == PlanType.STANDARD and s.program_id and s.program_level_id
+        }:
+            template = await self.calendar_template_repository.get_active_standard_for_program_level(
+                program_id, program_level_id
+            )
+            if template:
+                program_template_by_stage[(program_id, program_level_id)] = template
+        for program_id, level in {
+            (s.program_id, s.assigned_level)
+            for s in students
+            if s.plan == PlanType.STANDARD and s.program_id and s.assigned_level is not None
+        }:
+            template = await self.calendar_template_repository.get_active_standard_for_program(program_id, level)
+            if template:
+                program_template_by_program_and_level[(program_id, level.value)] = template
 
         alerts: dict[str, StudentAlerts] = {}
         for student in students:
-            if student.plan == PlanType.STANDARD and student.assigned_level is not None and student.created_by_id:
+            if student.plan == PlanType.STANDARD and student.program_id and student.program_level_id:
+                template = program_template_by_stage.get((student.program_id, student.program_level_id))
+            elif student.plan == PlanType.STANDARD and student.program_id and student.assigned_level is not None:
+                template = program_template_by_program_and_level.get((student.program_id, student.assigned_level.value))
+            elif student.plan == PlanType.STANDARD and student.assigned_level is not None and student.created_by_id:
                 template = standard_by_admin_and_level.get((student.created_by_id, student.assigned_level.value))
             elif student.plan == PlanType.PRO and student.assigned_plan_template_id:
                 template = pro_templates_by_id.get(student.assigned_plan_template_id)
             else:
                 template = None
             alerts[student.id] = _build_alerts(
-                template, sessions_by_student[student.id], submissions_by_student[student.id], student.program_start_date
+                template,
+                _for_current_enrollment(student, sessions_by_student[student.id]),
+                _for_current_enrollment(student, submissions_by_student[student.id]),
+                student.program_start_date,
             )
         return alerts
 

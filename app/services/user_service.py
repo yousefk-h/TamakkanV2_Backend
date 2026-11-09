@@ -176,9 +176,25 @@ class UserService:
     async def assign_plan(self, student_id: str, admin: User, body: AssignPlan) -> User:
         student = await self.get_own_student(student_id, admin)
 
+        if body.program_id:
+            from app.services.program_service import ProgramService
+            program_service = ProgramService()
+            program = await program_service.get_active(body.program_id)
+            if body.plan == PlanType.STANDARD:
+                program_level = program_service._resolve_program_level(
+                    program, body.program_level_id, body.assigned_level
+                )
+                student.program_level_id = program_level.id
+                resolved_level = program_level.difficulty_level
+            student.program_id = program.id
+        else:
+            student.program_id = None
+            student.program_level_id = None
+            resolved_level = body.assigned_level
+
         if body.plan == PlanType.STANDARD:
             student.plan = PlanType.STANDARD
-            student.assigned_level = body.assigned_level
+            student.assigned_level = resolved_level
             student.assigned_topic_ids = []
             student.assigned_plan_template_id = None
         else:
@@ -196,6 +212,10 @@ class UserService:
             # of truth instead of a hand-picked list that could drift from it.
             student.assigned_topic_ids = sorted({tid for entry in template.days for tid in entry.topic_ids})
             student.assigned_level = None
+            student.program_level_id = None
+            # Pro is an access/subscription plan with a directly assigned
+            # custom schedule, not an educational Program enrollment.
+            student.program_id = None
 
         # Assigning a plan (re)starts the program - "day 1" is whichever date
         # the admin gives, or now if they don't bother backdating/scheduling

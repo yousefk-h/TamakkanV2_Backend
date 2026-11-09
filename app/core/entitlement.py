@@ -24,20 +24,40 @@ reviewing content, not consuming a plan, so they are never gated by it - see
 `requester_may_open`.
 """
 
+from typing import TYPE_CHECKING, Optional
+
 from app.models.user import Role, User
 from app.schema.challenge import LessonDayState
 from app.services.progress_service import ProgressService
 
+if TYPE_CHECKING:
+    from app.services.enrollment_service import EnrollmentContext
 
-async def requester_may_open(requester: User, topic_id: str, progress_service: ProgressService) -> bool:
+
+async def requester_may_open(
+    requester: User,
+    topic_id: str,
+    progress_service: ProgressService,
+    enrollment_context: Optional["EnrollmentContext"] = None,
+) -> bool:
     """Administrator/Root: always. Student: the topic must be part of their
     own calendar (Standard's level, or Pro's assigned template) AND its
     scheduled day must have already been reached - a topic that isn't in
     the calendar at all and one that's merely locked both resolve here the
     same way, since neither is currently reachable.
+
+    `enrollment_context`, when given, resolves against that specific
+    Enrollment (`ProgressService.get_topic_statuses_for_context`) instead of
+    the student's single legacy calendar - see
+    `EnrollmentService.resolve_context`. Omitted (the default), this is
+    byte-for-byte the original legacy-only check every existing caller
+    already relied on.
     """
     if requester.role != Role.STUDENT:
         return True
-    statuses = await progress_service.get_topic_statuses(requester)
+    if enrollment_context is not None:
+        statuses = await progress_service.get_topic_statuses_for_context(requester, enrollment_context)
+    else:
+        statuses = await progress_service.get_topic_statuses(requester)
     status = statuses.get(topic_id)
     return status is not None and status != LessonDayState.LOCKED

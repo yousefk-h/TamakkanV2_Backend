@@ -28,6 +28,8 @@ class UserPublic(BaseSchema):
     email_verification_status: Literal["verified", "pending", "not_required"] = "not_required"
     email_verification_delivery: Literal["not_sent", "sent", "failed"] = "not_sent"
     plan: Optional[PlanType] = None
+    program_id: Optional[str] = None
+    program_level_id: Optional[str] = None
     assigned_level: Optional[Level] = None
     assigned_topic_ids: list[str] = Field(default_factory=list)
     # Pro only - which calendar template this student follows; see
@@ -51,6 +53,8 @@ class UserPublic(BaseSchema):
             email_verification_status=user.email_verification_status,
             email_verification_delivery=user.email_verification_delivery,
             plan=user.plan,
+            program_id=user.program_id,
+            program_level_id=user.program_level_id,
             assigned_level=user.assigned_level,
             assigned_topic_ids=user.assigned_topic_ids,
             assigned_plan_template_id=user.assigned_plan_template_id,
@@ -152,18 +156,20 @@ class SetTeacherActive(BaseModel):
 
 
 class AssignPlan(BaseModel):
-    """Standard = one `assigned_level` (a Standard student's group shares its
-    level's active calendar template - see `app.models.calendar_template` -
-    managed separately from this endpoint). Pro = one `assigned_plan_template_id`
+    """Standard = one educational Program stage (`program_id` plus
+    `program_level_id`), with `assigned_level` retained as its denormalized
+    engine difficulty and as a legacy fallback. Pro = one `assigned_plan_template_id`
     pointing at a `kind=custom` template from the admin's own library;
     `UserService.assign_plan` derives `assigned_topic_ids` from that
     template's own topic set, so there's one source of truth instead of two
-    that could drift. One schema, not two endpoints - the shape is validated
+    that could drift. Standard/Pro are access plans, never Program names. One schema, not two endpoints - the shape is validated
     against whichever `plan` is given, since the two are mutually exclusive
     by design, not by coincidence.
     """
 
     plan: PlanType
+    program_id: Optional[str] = None
+    program_level_id: Optional[str] = None
     assigned_level: Optional[Level] = None
     assigned_plan_template_id: Optional[str] = None
     # Day 1 of the student's calendar - omitted means "starting now."
@@ -174,8 +180,10 @@ class AssignPlan(BaseModel):
     @model_validator(mode="after")
     def _validate_shape_matches_plan(self) -> "AssignPlan":
         if self.plan == PlanType.STANDARD:
-            if self.assigned_level is None:
-                raise ValueError("assigned_level is required for a Standard plan")
+            if self.program_id and self.program_level_id is None and self.assigned_level is None:
+                raise ValueError("program_level_id is required when assigning a Program")
+            if not self.program_id and self.assigned_level is None:
+                raise ValueError("assigned_level is required for a legacy Standard assignment")
             if self.assigned_plan_template_id is not None:
                 raise ValueError("assigned_plan_template_id is not used for a Standard plan")
         else:
@@ -183,6 +191,8 @@ class AssignPlan(BaseModel):
                 raise ValueError("assigned_plan_template_id is required for a Pro plan")
             if self.assigned_level is not None:
                 raise ValueError("assigned_level is not used for a Pro plan")
+            if self.program_level_id is not None:
+                raise ValueError("program_level_id is not used for a Pro access plan")
         return self
 
 

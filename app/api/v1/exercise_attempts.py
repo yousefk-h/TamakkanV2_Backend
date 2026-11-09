@@ -1,5 +1,7 @@
 """Student lesson answers and teacher review queue."""
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, Query
 
 from app.core.security import require_role, require_teacher_or_administrator
@@ -23,10 +25,11 @@ async def submit_exercise_answer(
 @router.get("/exercise-attempts/me", response_model=list[ExerciseAttemptPublic])
 async def my_lesson_answers(
     topic_id: str,
+    enrollment_id: Optional[str] = Query(None, description="Required only if you have more than one active enrollment."),
     student: User = Depends(require_role(Role.STUDENT)),
     service: ExerciseAttemptService = Depends(get_exercise_attempt_service),
 ) -> list[ExerciseAttemptPublic]:
-    return [ExerciseAttemptPublic.from_attempt(item) for item in await service.mine(student, topic_id)]
+    return [ExerciseAttemptPublic.from_attempt(item) for item in await service.mine(student, topic_id, enrollment_id)]
 
 
 @router.get("/exercise-attempts/review", response_model=list[ExerciseAttemptPublic])

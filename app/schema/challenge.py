@@ -8,7 +8,7 @@ on more than one day (while backlogged) resolves to one overall status.
 
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LessonDayState(str, Enum):
@@ -36,6 +36,8 @@ class LessonDaySlot(BaseModel):
 
 class ChallengeCalendar(BaseModel):
     lesson_days: list[LessonDaySlot]
+    total_days: int = 30
+    rest_days: list[int] = Field(default_factory=list)
     # Count of individual `MISSED` course-occurrences as of today - 0 means
     # nothing to remind about.
     pending_count: int

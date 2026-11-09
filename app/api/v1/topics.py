@@ -26,7 +26,7 @@ from app.core.security import get_current_user, require_teacher_or_administrator
 from app.core.storage import UploadFailedError, get_image_storage, get_lesson_audio_storage
 from app.core.exceptions import UnprocessableException
 from app.core.transcript_english_review import TranscriptReviewResult
-from app.models.topic_content import TranscriptState
+from app.models.topic_content import Level, TranscriptState
 from app.models.user import Role, User
 from app.schema.topic import (
     ApproveTranscriptRequest,
@@ -41,6 +41,7 @@ from app.schema.topic import (
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.services.topic_content_service import (
     MAX_PDF_UPLOAD_BYTES,
+    MAX_SOURCE_VIDEO_UPLOAD_BYTES,
     MAX_THUMBNAIL_UPLOAD_BYTES,
     TopicContentService,
     get_topic_content_service,
@@ -53,6 +54,7 @@ from app.services.transcript_review_service import (
     TranscriptReviewService,
     get_transcript_review_service,
 )
+from app.services.enrollment_service import EnrollmentService, get_enrollment_service
 from app.services.exercise_draft_service import DraftExercisesRequest, DraftExercisesResponse, ExerciseDraftService, get_exercise_draft_service
 
 router = APIRouter()
@@ -102,6 +104,8 @@ async def list_topics(
     ),
     limit: int = Query(DEFAULT_PAGE_SIZE, gt=0, le=MAX_PAGE_SIZE, description="Page size."),
     skip: int = Query(0, ge=0, description="Number of topics to skip, for paging."),
+    search: Optional[str] = Query(None, min_length=1, max_length=100, description="Literal title, vocabulary, or exercise-prompt search."),
+    level: Optional[Level] = Query(None, description="Suggested/default difficulty filter."),
     requester: User = Depends(get_current_user),
     service: TopicContentService = Depends(get_topic_content_service),
 ) -> list[TopicListItem]:
@@ -115,14 +119,18 @@ async def list_topics(
     for that. See the schema for why.
     """
     triples = await service.list_for_requester(
-        requester, transcript_state=transcript_state, limit=limit, skip=skip
+        requester, transcript_state=transcript_state, limit=limit, skip=skip, search=search, level=level
     )
+    creator_ids = list({topic.created_by_id for topic, _, _ in triples if topic.created_by_id})
+    creators = await User.find({"_id": {"$in": creator_ids}, "is_deleted": False}).to_list() if creator_ids else []
+    creator_names = {creator.id: creator.full_name for creator in creators}
     return [
         TopicListItem(
             id=t.id,
             created_at=t.created_at,
             updated_at=t.updated_at,
             title=t.title,
+            author_name=creator_names.get(t.created_by_id) if t.created_by_id else None,
             level=t.level,
             level_profile_id=t.level_profile_id,
             level_name=t.level_name,
@@ -136,6 +144,10 @@ async def list_topics(
             unit_id=t.unit_id,
             order_index=t.order_index,
             has_pdf=t.pdf_extracted_text is not None,
+            has_video=bool(t.youtube_urls or t.uploaded_video_url),
+            has_audio=any(exercise.audio_url for exercise in t.lesson_exercises),
+            exercise_count=len(t.lesson_exercises),
+            exercise_kinds=list(dict.fromkeys(exercise.kind for exercise in t.lesson_exercises)),
         )
         for t, status, session_minutes in triples
     ]
@@ -144,15 +156,21 @@ async def list_topics(
 @router.get("/topics/{topic_id}", response_model=TopicPublic)
 async def get_topic(
     topic_id: str,
+    enrollment_id: Optional[str] = Query(None, description="Required only if you have more than one active enrollment."),
     requester: User = Depends(get_current_user),
     service: TopicContentService = Depends(get_topic_content_service),
+    enrollments: EnrollmentService = Depends(get_enrollment_service),
 ) -> TopicPublic:
     """Fetch a single topic by id. For a Student, rejected if the topic is
-    outside their assigned plan (Kanban card #14). For an Administrator,
-    rejected if authored by a different Administrator (teacher isolation) -
-    Root is unaffected.
+    outside their assigned plan/enrollment (Kanban card #14) - resolved
+    against `enrollment_id` when given, the student's one unambiguous active
+    enrollment otherwise, or the legacy `program_id`/`program_level_id` for an
+    account with no Enrollment at all (see `EnrollmentService.resolve_context`).
+    For an Administrator, rejected if authored by a different Administrator
+    (teacher isolation) - Root is unaffected.
     """
-    topic, lesson_status, session_minutes = await service.get_one_for_requester(topic_id, requester)
+    context = await enrollments.resolve_context(requester, enrollment_id) if requester.role == Role.STUDENT else None
+    topic, lesson_status, session_minutes = await service.get_one_for_requester(topic_id, requester, context)
     return TopicPublic.from_topic(
         topic, include_internal=requester.role != Role.STUDENT, lesson_status=lesson_status, session_minutes=session_minutes
     )
@@ -266,6 +284,29 @@ async def upload_topic_pdf(
         topic_id, file_bytes, file.content_type or "application/octet-stream", file.filename or "lesson.pdf", admin
     )
     return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/source-video", response_model=TopicPublic)
+async def upload_topic_source_video(
+    topic_id: str,
+    file: UploadFile = File(..., description="Teacher lesson video, max 80 MB."),
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    file_bytes = await file.read(MAX_SOURCE_VIDEO_UPLOAD_BYTES + 1)
+    topic = await service.upload_source_video(
+        topic_id, file_bytes, file.content_type or "application/octet-stream", file.filename or "lesson-video.mp4", admin
+    )
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.delete("/topics/{topic_id}/source-video", response_model=TopicPublic)
+async def remove_topic_source_video(
+    topic_id: str,
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    return TopicPublic.from_topic(await service.remove_source_video(topic_id, admin), include_internal=True)
 
 
 @router.delete("/topics/{topic_id}/pdf", response_model=TopicPublic)

@@ -17,6 +17,9 @@ class SessionStartRequest(BaseModel):
     # Only picks WHICH agent to talk to. Prompt, level and every other lesson
     # setting are always read server-side from the saved lesson.
     mode: PracticeMode = PracticeMode.TOPIC_DISCUSSION
+    # Required only when the student has more than one active Enrollment -
+    # see `EnrollmentService.resolve_context`. Omitted otherwise.
+    enrollment_id: Optional[str] = None
 
 
 class BrowserTranscriptTurn(BaseModel):

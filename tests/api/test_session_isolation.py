@@ -461,6 +461,7 @@ async def test_report_generation_itself_refuses_voice_sessions(client, livekit):
     from app.repositories.live_session_repository import LiveSessionRepository
     from app.repositories.topic_content_repository import TopicContentRepository
     from app.repositories.user_repository import UserRepository
+    from app.services.enrollment_service import get_enrollment_service
     from app.services.live_session_service import LiveSessionService
     from app.services.progress_service import get_progress_service
 
@@ -472,7 +473,7 @@ async def test_report_generation_itself_refuses_voice_sessions(client, livekit):
     row.transcript_history = [InteractionTurn(**turn) for turn in SUFFICIENT_EVIDENCE_TRANSCRIPT]  # corrupted / hand-edited data
     await row.save()
 
-    service = LiveSessionService(LiveSessionRepository(), TopicContentRepository(), UserRepository(), AuditLogRepository(), scorer, get_progress_service())
+    service = LiveSessionService(LiveSessionRepository(), TopicContentRepository(), UserRepository(), AuditLogRepository(), scorer, get_progress_service(), get_enrollment_service())
     await service.generate_report(voice["session_id"])
     assert scorer.calls == [] and (await _row(voice)).report is None
 

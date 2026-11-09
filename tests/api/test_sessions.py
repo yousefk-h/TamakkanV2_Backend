@@ -22,6 +22,7 @@ from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.live_session_repository import LiveSessionRepository
 from app.repositories.topic_content_repository import TopicContentRepository
 from app.repositories.user_repository import UserRepository
+from app.services.enrollment_service import get_enrollment_service
 from app.services.live_session_service import LiveSessionService, get_live_session_service
 from app.services.progress_service import get_progress_service
 from app.utils.time import utcnow
@@ -81,7 +82,8 @@ class FakeSessionScorer:
 
 def _override_session_scorer(scorer: FakeSessionScorer):
     app.dependency_overrides[get_live_session_service] = lambda: LiveSessionService(
-        LiveSessionRepository(), TopicContentRepository(), UserRepository(), AuditLogRepository(), scorer, get_progress_service()
+        LiveSessionRepository(), TopicContentRepository(), UserRepository(), AuditLogRepository(), scorer,
+        get_progress_service(), get_enrollment_service(),
     )
 
 

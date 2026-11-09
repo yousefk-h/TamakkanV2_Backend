@@ -106,6 +106,32 @@ async def test_a_friday_check_in_day_cannot_be_assigned_a_topic(client):
     assert resp.status_code == 422
 
 
+async def test_teacher_chooses_program_length_and_rest_days(client):
+    token = await _login(client, Role.TEACHER, "calendar-options@example.com")
+    topic = await _create_topic(client, token)
+    response = client.post(
+        "/api/v1/calendar-templates",
+        json={
+            "name": "Two-week sprint",
+            "kind": "custom",
+            "duration_days": 14,
+            "rest_days": [4, 9],
+            "days": [{"day": 3, "topic_ids": [topic["id"]]}],
+        },
+        headers=_headers(token),
+    )
+    assert response.status_code == 200
+    assert response.json()["duration_days"] == 14
+    assert response.json()["rest_days"] == [4, 9]
+
+    invalid = client.patch(
+        f"/api/v1/calendar-templates/{response.json()['id']}",
+        json={"rest_days": [3]},
+        headers=_headers(token),
+    )
+    assert invalid.status_code == 422
+
+
 async def test_two_entries_cannot_claim_the_same_day(client):
     token = await _login(client, Role.TEACHER, "admin@example.com")
     topic = await _create_topic(client, token)

@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 from beanie.odm.operators.update.general import Set
 
-from app.models.topic_content import TopicContent, TranscriptState
+from app.models.topic_content import Level, TopicContent, TranscriptState
 from app.repositories.base_repository import BaseRepository
 from app.utils.time import utcnow
 
@@ -39,6 +39,8 @@ class TopicContentRepository(BaseRepository[TopicContent]):
         limit: int = DEFAULT_PAGE_SIZE,
         skip: int = 0,
         owner_id: Optional[str] = None,
+        search: Optional[str] = None,
+        level: Optional[Level] = None,
     ) -> list[TopicContent]:
         """`owner_id=None` (Root/internal use) returns every topic, unfiltered
         by author - unchanged from before teacher isolation. Given, it scopes
@@ -50,6 +52,15 @@ class TopicContentRepository(BaseRepository[TopicContent]):
         query = self._base_query(transcript_state)
         if owner_id is not None:
             query["created_by_id"] = {"$in": [owner_id, None]}
+        if level is not None:
+            query["level"] = level.value
+        if search and search.strip():
+            literal = re.escape(search.strip())
+            query["$or"] = [
+                {"title": {"$regex": literal, "$options": "i"}},
+                {"vocabulary.term": {"$regex": literal, "$options": "i"}},
+                {"lesson_exercises.prompt": {"$regex": literal, "$options": "i"}},
+            ]
         return await self._paged(query, limit, skip)
 
     async def count_created_by(self, owner_id: str) -> int:

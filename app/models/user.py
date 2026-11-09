@@ -96,7 +96,11 @@ class User(BaseDocument):
     # --- Student-only fields (role == STUDENT); left at their defaults and
     # unused for Administrator accounts. ---
     plan: Optional[PlanType] = None
-    assigned_level: Optional[Level] = None  # Standard: the one level assigned to their group
+    program_id: Annotated[Optional[str], Indexed()] = None
+    program_level_id: Annotated[Optional[str], Indexed()] = None
+    # Denormalized engine difficulty for compatibility/scoring. The Program
+    # stage id above is authoritative for Program enrollment.
+    assigned_level: Optional[Level] = None
     # Pro: hand-picked, any level. A plain id list, not `list[Link[TopicContent]]`
     # - same reasoning as `created_by_id` above: Links can't be queried/checked
     # for containment reliably, and this field was never actually read or

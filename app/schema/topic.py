@@ -19,6 +19,7 @@ once entitlement landed in cards #14/#15, and was never true of the AI's own
 prompt text.
 """
 
+from datetime import datetime
 from typing import Annotated, Optional
 from urllib.parse import urlparse
 
@@ -141,6 +142,8 @@ class LessonExerciseIn(LessonExercise):
     audio_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
     pairs: Annotated[list[ExercisePairIn], Field(max_length=8)] = Field(default_factory=list)
     min_words: Annotated[int, Field(ge=0, le=500)] = 0
+    allow_resubmit: bool = True
+    deadline_at: Optional[datetime] = None
 
     @model_validator(mode="after")
     def valid_answer(self) -> "LessonExerciseIn":
@@ -170,7 +173,10 @@ LessonExerciseList = Annotated[list[LessonExerciseIn], Field(max_length=MAX_LIST
 
 class TopicCreate(BaseModel):
     title: Title
-    level: Level
+    # Legacy/default library difficulty. A Program placement supplies the
+    # authoritative delivery stage/difficulty, so creation no longer forces
+    # an author to make a Program-specific decision here.
+    level: Level = Level.BEGINNER
     level_profile_id: Optional[str] = None
     youtube_urls: YouTubeUrlList = Field(default_factory=list)
     # Topic organization by unit + order (card #17). `unit_id` is validated
@@ -270,6 +276,7 @@ class TopicListItem(BaseSchema):
     """
 
     title: str
+    author_name: Optional[str] = None
     level: Level
     level_profile_id: Optional[str] = None
     level_name: str = ""
@@ -301,6 +308,10 @@ class TopicListItem(BaseSchema):
     # #16) - the list view doesn't need the extracted text itself (size),
     # same reasoning as leaving transcripts off this shape.
     has_pdf: bool = False
+    has_video: bool = False
+    has_audio: bool = False
+    exercise_count: int = 0
+    exercise_kinds: list[ExerciseKind] = Field(default_factory=list)
 
 
 class TopicPublic(BaseSchema):
@@ -316,6 +327,7 @@ class TopicPublic(BaseSchema):
     """
 
     title: str
+    content_revision: int
     level: Level
     level_profile_id: Optional[str]
     level_name: str
@@ -328,6 +340,8 @@ class TopicPublic(BaseSchema):
     has_custom_thumbnail: bool = False
     # Same as `TopicListItem.video_duration_seconds`.
     video_duration_seconds: Optional[int] = None
+    uploaded_video_url: Optional[str] = None
+    uploaded_video_filename: Optional[str] = None
     warm_up_questions: list[str]
     guided_questions: list[GuidedQuestionPart]
     useful_phrases: list[UsefulPhraseGroup]
@@ -369,6 +383,7 @@ class TopicPublic(BaseSchema):
     arabic_intervention_level: Optional[ArabicInterventionLevel] = None
     transcript_state: Optional[TranscriptState] = None
     raw_transcript: list[TranscriptSegment] = Field(default_factory=list)
+    transcript_source_labels: list[str] = Field(default_factory=list)
     # Whether `raw_transcript` came from a real YouTube caption track or
     # Gemini transcribing the video's audio - `None` before the first run
     # completes. See `TranscriptSource`.
@@ -401,6 +416,7 @@ class TopicPublic(BaseSchema):
                 "arabic_intervention_level": topic.arabic_intervention_level,
                 "transcript_state": topic.transcript_state,
                 "raw_transcript": topic.raw_transcript,
+                "transcript_source_labels": topic.transcript_source_labels,
                 "transcript_source": topic.transcript_source,
                 "pdf_url": topic.pdf_url,
                 "pdf_filename": topic.pdf_filename,
@@ -414,6 +430,7 @@ class TopicPublic(BaseSchema):
             created_at=topic.created_at,
             updated_at=topic.updated_at,
             title=topic.title,
+            content_revision=topic.content_revision,
             level=topic.level,
             level_profile_id=topic.level_profile_id,
             level_name=topic.level_name,
@@ -422,6 +439,8 @@ class TopicPublic(BaseSchema):
             thumbnail_url=resolve_thumbnail_url(topic),
             has_custom_thumbnail=bool(topic.custom_thumbnail_url),
             video_duration_seconds=topic.video_duration_seconds,
+            uploaded_video_url=topic.uploaded_video_url,
+            uploaded_video_filename=topic.uploaded_video_filename,
             warm_up_questions=topic.warm_up_questions,
             guided_questions=topic.guided_questions,
             useful_phrases=topic.useful_phrases,

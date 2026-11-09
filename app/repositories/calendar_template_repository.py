@@ -41,13 +41,68 @@ class CalendarTemplateRepository(BaseRepository[CalendarTemplate]):
             CalendarTemplate.is_deleted == False,  # noqa: E712
         )
 
-    async def deactivate_all_standard(self, owner_admin_id: str, level: Level) -> None:
-        await CalendarTemplate.find(
-            CalendarTemplate.owner_admin_id == owner_admin_id,
+    async def get_active_standard_for_program(self, program_id: str, level: Level) -> Optional[CalendarTemplate]:
+        return await CalendarTemplate.find_one(
+            CalendarTemplate.program_id == program_id,
             CalendarTemplate.kind == TemplateKind.STANDARD,
             CalendarTemplate.level == level,
             CalendarTemplate.is_active == True,  # noqa: E712
-        ).update(Set({"is_active": False, "updated_at": utcnow()}))
+            CalendarTemplate.is_deleted == False,  # noqa: E712
+        )
+
+    async def get_active_standard_for_program_level(
+        self, program_id: str, program_level_id: str
+    ) -> Optional[CalendarTemplate]:
+        return await CalendarTemplate.find_one(
+            CalendarTemplate.program_id == program_id,
+            CalendarTemplate.program_level_id == program_level_id,
+            CalendarTemplate.kind == TemplateKind.STANDARD,
+            CalendarTemplate.is_active == True,  # noqa: E712
+            CalendarTemplate.is_deleted == False,  # noqa: E712
+        )
+
+    async def deactivate_all_standard(
+        self,
+        owner_admin_id: str,
+        level: Level,
+        program_id: str | None = None,
+        program_level_id: str | None = None,
+    ) -> None:
+        query: dict = {
+            "owner_admin_id": owner_admin_id,
+            "kind": TemplateKind.STANDARD.value,
+            "level": level.value,
+            "is_active": True,
+        }
+        if program_id:
+            query.update(program_id=program_id, program_level_id=program_level_id)
+        else:
+            query["program_id"] = None
+        await CalendarTemplate.find(query).update(Set({"is_active": False, "updated_at": utcnow()}))
+
+    async def get_active_cohort_template(self, cohort_id: str, program_level_id: str) -> Optional[CalendarTemplate]:
+        return await CalendarTemplate.find_one(
+            CalendarTemplate.cohort_id == cohort_id,
+            CalendarTemplate.program_level_id == program_level_id,
+            CalendarTemplate.kind == TemplateKind.COHORT,
+            CalendarTemplate.is_active == True,  # noqa: E712
+            CalendarTemplate.is_deleted == False,  # noqa: E712
+        )
+
+    async def get_effective_schedule(
+        self, program_id: str, program_level_id: str, cohort_id: Optional[str]
+    ) -> Optional[CalendarTemplate]:
+        """The ONE deterministic answer to "what schedule does this
+        enrollment actually follow": a Cohort's own stage template if it has
+        one, otherwise the Program stage's shared STANDARD template. Every
+        enrollment-aware read path must call this rather than re-deriving the
+        same choice independently.
+        """
+        if cohort_id:
+            cohort_template = await self.get_active_cohort_template(cohort_id, program_level_id)
+            if cohort_template is not None:
+                return cohort_template
+        return await self.get_active_standard_for_program_level(program_id, program_level_id)
 
     async def get_many_by_ids(self, template_ids: list[str]) -> list[CalendarTemplate]:
         if not template_ids:

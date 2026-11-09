@@ -17,6 +17,10 @@ class ExerciseAttemptCreate(BaseModel):
     exercise_index: int = Field(ge=0, le=49)
     topic_updated_at: datetime
     answer: StrictInt | AnswerText | list[StrictInt]
+    # Required only when the student has more than one active Enrollment -
+    # see `EnrollmentService.resolve_context`. Omitted otherwise (0 or 1
+    # active enrollment resolves unambiguously on its own).
+    enrollment_id: Optional[str] = None
 
 
 class ExerciseReviewRequest(BaseModel):
@@ -27,6 +31,7 @@ class ExerciseReviewRequest(BaseModel):
 class ExerciseAttemptPublic(BaseSchema):
     student_id: str
     student_name: str
+    enrollment_id: Optional[str] = None
     topic_id: str
     topic_title: str
     exercise_index: int

@@ -13,7 +13,13 @@ class HomeworkCreate(BaseModel):
     instructions: str = Field(default="", max_length=5000)
     kind: HomeworkKind = HomeworkKind.LESSON
     due_at: datetime
-    participant_ids: list[str] = Field(min_length=1, max_length=MAX_LIST_ITEMS)
+    # Either a hand-picked/legacy roster (existing behavior)...
+    participant_ids: list[str] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)
+    # ...or a Cohort target: every student currently enrolled in that Cohort
+    # (optionally narrowed to one of its stages) that the caller is
+    # themselves authorized to reach - see `HomeworkService.create`.
+    cohort_id: Optional[str] = None
+    program_level_id: Optional[str] = None
     topic_id: Optional[str] = None
     external_url: str = Field(default="", max_length=MAX_URL_LENGTH)
 
@@ -28,6 +34,10 @@ class HomeworkCreate(BaseModel):
             raise ValueError("Lesson homework needs a lesson")
         if self.kind == HomeworkKind.LINK and not self.external_url.startswith("https://"):
             raise ValueError("Link homework needs an https:// URL")
+        if not self.participant_ids and not self.cohort_id:
+            raise ValueError("Choose students, or a Cohort to target")
+        if self.program_level_id and not self.cohort_id:
+            raise ValueError("A stage only makes sense together with a Cohort")
         return self
 
 
@@ -38,6 +48,9 @@ class HomeworkPublic(BaseSchema):
     kind: HomeworkKind
     due_at: datetime
     participant_ids: list[str]
+    cohort_id: Optional[str] = None
+    program_id: Optional[str] = None
+    program_level_id: Optional[str] = None
     topic_id: Optional[str]
     topic_title: Optional[str] = None
     external_url: str

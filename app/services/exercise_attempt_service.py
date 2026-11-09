@@ -3,6 +3,7 @@
 import hashlib
 import json
 from datetime import timezone
+from typing import Optional
 
 from beanie.odm.operators.update.general import Set
 from app.core.exceptions import ConflictException, ForbiddenException, NotFoundException, UnprocessableException
@@ -10,7 +11,9 @@ from app.models.exercise_attempt import ExerciseAttempt
 from app.models.topic_content import ExerciseKind, LessonExercise, TopicContent
 from app.models.user import Role, User
 from app.schema.exercise_attempt import ExerciseAttemptCreate, ExerciseReviewRequest
+from app.services.enrollment_service import EnrollmentService, get_enrollment_service
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
+from app.utils.time import utcnow
 
 ANSWER_KINDS = frozenset({ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.IMAGE_COMPLETION, ExerciseKind.LISTENING,
                           ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.GAME, ExerciseKind.WRITING,
@@ -24,11 +27,13 @@ def exercise_hash(exercise: LessonExercise) -> str:
 
 
 class ExerciseAttemptService:
-    def __init__(self, topics: TopicContentService) -> None:
+    def __init__(self, topics: TopicContentService, enrollments: EnrollmentService) -> None:
         self.topics = topics
+        self.enrollments = enrollments
 
     async def submit(self, student: User, body: ExerciseAttemptCreate) -> ExerciseAttempt:
-        topic, _, _ = await self.topics.get_one_for_requester(body.topic_id, student)
+        context = await self.enrollments.resolve_context(student, body.enrollment_id)
+        topic, _, _ = await self.topics.get_one_for_requester(body.topic_id, student, context)
         if body.exercise_index >= len(topic.lesson_exercises):
             raise NotFoundException("Exercise not found in this lesson")
         expected_time = body.topic_updated_at
@@ -39,6 +44,32 @@ class ExerciseAttemptService:
         exercise = topic.lesson_exercises[body.exercise_index]
         if exercise.kind not in ANSWER_KINDS:
             raise UnprocessableException("This skill does not accept a typed answer")
+        deadline = exercise.deadline_at
+        if deadline is not None:
+            if deadline.tzinfo is not None:
+                deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+            if utcnow() > deadline:
+                raise ForbiddenException("The deadline for this activity has passed")
+        # A no-resubmission lesson is enforced here, before accepting a new
+        # answer. The UI may hide its button, but that is never the policy
+        # boundary. The context query mirrors the supersession rule below.
+        if not exercise.allow_resubmit:
+            prior_base = {
+                "student_id": student.id, "topic_id": topic.id,
+                "exercise_index": body.exercise_index, "exercise_hash": exercise_hash(exercise),
+                "is_deleted": False, "superseded": False,
+            }
+            if context.enrollment and context.legacy_attributable:
+                prior_query: dict = {"$or": [
+                    {**prior_base, "enrollment_id": context.enrollment.id},
+                    {**prior_base, "program_id": context.program_id, "enrollment_id": None},
+                ]}
+            elif context.enrollment:
+                prior_query = {**prior_base, "enrollment_id": context.enrollment.id}
+            else:
+                prior_query = {**prior_base, "program_id": context.program_id, "enrollment_id": None}
+            if await ExerciseAttempt.find_one(prior_query):
+                raise ConflictException("This activity does not allow another submission")
         answer = body.answer
         correct = None
         correct_option = None
@@ -69,6 +100,8 @@ class ExerciseAttemptService:
         if isinstance(answer, str):
             answer_display = answer.strip()
         attempt = ExerciseAttempt(student_id=student.id, student_name=student.full_name,
+                                  program_id=context.program_id, program_level_id=context.program_level_id,
+                                  enrollment_id=context.enrollment.id if context.enrollment else None,
                                   topic_id=topic.id, topic_title=topic.title,
                                   exercise_index=body.exercise_index, exercise_hash=exercise_hash(exercise),
                                   exercise_kind=exercise.kind, exercise_prompt=exercise.prompt,
@@ -76,14 +109,44 @@ class ExerciseAttemptService:
                                   answer_display=answer_display,
                                   correct=correct, correct_option=correct_option, score=score, reviewed=reviewed)
         await attempt.insert()
-        await ExerciseAttempt.find({"student_id": student.id, "topic_id": topic.id,
-                                    "exercise_index": body.exercise_index, "exercise_hash": attempt.exercise_hash,
-                                    "_id": {"$ne": attempt.id}, "superseded": False}).update(Set({"superseded": True}))
+        # Supersede this student's previous attempt at the same exercise
+        # WITHIN THE SAME ENROLLMENT CONTEXT only - never a different
+        # enrollment's, even on the same Program/stage (e.g. two Cohorts).
+        # A pre-existing legacy row (no enrollment_id) is also superseded
+        # when it's unambiguously this context's - see
+        # `EnrollmentContext.legacy_attributable` - so a migrated account
+        # doesn't end up with two "current" attempts for one exercise.
+        base_match = {
+            "student_id": student.id, "topic_id": topic.id,
+            "exercise_index": body.exercise_index, "exercise_hash": attempt.exercise_hash,
+            "_id": {"$ne": attempt.id}, "superseded": False,
+        }
+        if attempt.enrollment_id and context.legacy_attributable:
+            supersede_query = {"$or": [
+                {**base_match, "enrollment_id": attempt.enrollment_id},
+                {**base_match, "program_id": context.program_id, "enrollment_id": None},
+            ]}
+        elif attempt.enrollment_id:
+            supersede_query = {**base_match, "enrollment_id": attempt.enrollment_id}
+        else:
+            supersede_query = {**base_match, "program_id": context.program_id, "enrollment_id": None}
+        await ExerciseAttempt.find(supersede_query).update(Set({"superseded": True}))
         return attempt
 
-    async def mine(self, student: User, topic_id: str) -> list[ExerciseAttempt]:
-        topic, _, _ = await self.topics.get_one_for_requester(topic_id, student)
-        attempts = await ExerciseAttempt.find({"student_id": student.id, "topic_id": topic_id, "is_deleted": False, "superseded": False}).sort("-created_at").to_list()
+    async def mine(self, student: User, topic_id: str, enrollment_id: Optional[str] = None) -> list[ExerciseAttempt]:
+        context = await self.enrollments.resolve_context(student, enrollment_id)
+        topic, _, _ = await self.topics.get_one_for_requester(topic_id, student, context)
+        base = {"student_id": student.id, "topic_id": topic_id, "is_deleted": False, "superseded": False}
+        if context.enrollment is not None and context.legacy_attributable:
+            query: dict = {"$or": [
+                {**base, "enrollment_id": context.enrollment.id},
+                {**base, "program_id": context.program_id, "enrollment_id": None},
+            ]}
+        elif context.enrollment is not None:
+            query = {**base, "enrollment_id": context.enrollment.id}
+        else:
+            query = {**base, "program_id": context.program_id, "enrollment_id": None}
+        attempts = await ExerciseAttempt.find(query).sort("-created_at").to_list()
         hashes = {index: exercise_hash(exercise) for index, exercise in enumerate(topic.lesson_exercises)}
         current: list[ExerciseAttempt] = []
         seen: set[int] = set()
@@ -118,4 +181,4 @@ class ExerciseAttemptService:
 
 
 def get_exercise_attempt_service() -> ExerciseAttemptService:
-    return ExerciseAttemptService(get_topic_content_service())
+    return ExerciseAttemptService(get_topic_content_service(), get_enrollment_service())

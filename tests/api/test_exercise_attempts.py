@@ -1,5 +1,7 @@
 """Persisted lesson answers, trusted scoring, and teacher review boundaries."""
 
+from datetime import timedelta
+
 from app.core.security import hash_password
 from app.models.topic_content import Level
 from app.models.user import PlanType, Role, User
@@ -24,9 +26,10 @@ async def test_student_answers_and_teacher_review_are_persisted_and_scoped(clien
     outsider_token, _ = await _login(client, "other-student@example.com", Role.STUDENT)
     student_headers = {"Authorization": f"Bearer {student_token}"}
     exercises = [
-        {"kind": "multiple_choice", "prompt": "Choose the greeting", "options": ["Hello", "Goodbye"], "correct_option": 0},
-        {"kind": "writing", "prompt": "Write two words", "min_words": 2},
+        {"kind": "multiple_choice", "prompt": "Choose the greeting", "options": ["Hello", "Goodbye"], "correct_option": 0, "allow_resubmit": False},
+        {"kind": "writing", "prompt": "Write two words", "min_words": 2, "deadline_at": (utcnow() + timedelta(days=1)).isoformat()},
         {"kind": "game", "prompt": "Match", "pairs": [{"left": "hello", "right": "مرحبا"}, {"left": "bye", "right": "وداعا"}]},
+        {"kind": "writing", "prompt": "Expired response", "deadline_at": (utcnow() - timedelta(minutes=1)).isoformat()},
     ]
     topic_response = client.post("/api/v1/topics", json={"title": "Greetings", "level": "beginner", "lesson_exercises": exercises}, headers=teacher_headers)
     assert topic_response.status_code == 200
@@ -47,6 +50,7 @@ async def test_student_answers_and_teacher_review_are_persisted_and_scoped(clien
     assert choice.json()["score"] == 100
     assert choice.json()["reviewed"] is True
     assert choice.json()["correct_option"] == 0
+    assert client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": 1}, headers=student_headers).status_code == 409
     assert client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 1, "topic_updated_at": revision, "answer": "one"}, headers=student_headers).status_code == 422
     writing = client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 1, "topic_updated_at": revision, "answer": "Hello teacher"}, headers=student_headers)
     assert writing.status_code == 201
@@ -57,6 +61,7 @@ async def test_student_answers_and_teacher_review_are_persisted_and_scoped(clien
     game = client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 2, "topic_updated_at": revision, "answer": [1, 0]}, headers=student_headers)
     assert game.status_code == 201
     assert game.json()["score"] == 0
+    assert client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 3, "topic_updated_at": revision, "answer": "Too late"}, headers=student_headers).status_code == 403
 
     queue = client.get("/api/v1/exercise-attempts/review", headers=teacher_headers)
     assert queue.status_code == 200
