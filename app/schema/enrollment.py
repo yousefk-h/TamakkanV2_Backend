@@ -90,6 +90,28 @@ class EnrollmentPublic(BaseSchema):
         })
 
 
+class TaughtStudent(BaseModel):
+    """One row of a teacher's "My Students" page - a real Student account
+    deduplicated across every Cohort the caller teaches, not a guess that
+    every center student belongs to them. `enrollments` lists only the
+    enrollments the caller is actually authorized to see (their own
+    Cohorts, and only the stages they're assigned to within a multi-stage
+    Cohort) - never every enrollment this student happens to hold."""
+
+    id: str
+    full_name: str
+    email: str
+    is_active: bool
+    enrollments: list[EnrollmentPublic] = Field(default_factory=list)
+
+
+class TaughtStudentPage(BaseModel):
+    items: list[TaughtStudent]
+    total: int
+    page: int
+    limit: int
+
+
 class EnrollmentScheduleDay(BaseModel):
     day: int
     topic_ids: list[str]

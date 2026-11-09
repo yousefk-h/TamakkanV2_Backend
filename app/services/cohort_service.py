@@ -15,7 +15,7 @@ from app.core.exceptions import ForbiddenException, NotFoundException, Unprocess
 from app.models.calendar_template import CalendarDayEntry, CalendarTemplate, TemplateKind
 from app.models.cohort import Cohort, CohortStatus, CohortTeacherAssignment
 from app.models.enrollment import Enrollment, EnrollmentSource, EnrollmentStatus, LateJoinMode
-from app.models.program import ProgramLevelDefinition
+from app.models.program import Program, ProgramLevelDefinition
 from app.models.user import Role, User
 from app.repositories.calendar_template_repository import CalendarTemplateRepository
 from app.schema.cohort import CohortCreate, CohortUpdate
@@ -339,6 +339,29 @@ class CohortService:
             processed.append(enrollment)
         return created, already_enrolled, processed
 
+    async def may_reach_student(self, caller: User, student: User) -> bool:
+        """Shared authorization gate for anything that reaches across to one
+        specific student by id (messaging, student-progress) - Center Admin/
+        Root always; a Teacher who personally created this student (the
+        existing, narrower ownership relationship); or a Teacher with at
+        least one active, stage-matching Enrollment for this student in a
+        Cohort they teach - the same reach as `get_roster`/`list_my_students`.
+        """
+        if caller.role in (Role.ADMINISTRATOR, Role.ROOT):
+            return True
+        if caller.role != Role.TEACHER:
+            return False
+        if student.created_by_id == caller.id:
+            return True
+        cohorts = await self.list_for_teacher(caller)
+        stage_map = {c.id: set(accessible_stage_ids(c, caller)) for c in cohorts}
+        if not stage_map:
+            return False
+        enrollments = await Enrollment.find({
+            "student_id": student.id, "is_deleted": False, "cohort_id": {"$in": list(stage_map)},
+        }).to_list()
+        return any(e.program_level_id in stage_map.get(e.cohort_id, set()) for e in enrollments)
+
     async def remove_student(self, cohort_id: str, student_id: str) -> None:
         enrollment = await Enrollment.find_one({
             "cohort_id": cohort_id, "student_id": student_id, "is_deleted": False,
@@ -348,6 +371,91 @@ class CohortService:
         enrollment.status = EnrollmentStatus.WITHDRAWN
         enrollment.is_deleted = True
         await enrollment.save()
+
+    async def list_my_students(
+        self,
+        caller: User,
+        *,
+        search: Optional[str] = None,
+        program_id: Optional[str] = None,
+        cohort_id: Optional[str] = None,
+        program_level_id: Optional[str] = None,
+        page: int = 1,
+        limit: int = 20,
+    ) -> tuple[list[dict], int]:
+        """The real "My Students" population: every Student with an active
+        Enrollment in a Cohort this caller actually teaches - the Lead
+        Teacher of a Cohort sees its whole roster, a stage-scoped additional
+        teacher sees only their assigned stages, same reach rules as
+        `get_roster`. Deliberately NOT `created_by_id` (the older, narrower
+        "accounts this teacher personally created" concept `GET /users`
+        still serves) - a teacher can be assigned to teach students a
+        different teacher or Center Admin created. Center Admin reach is
+        every Cohort in the center, same as everywhere else.
+
+        Returns `(rows, total)` where each row is `{"user": User,
+        "enrollments": list[Enrollment with denormalized display fields]}` -
+        the route builds the response schema. Pagination/search happen in
+        Python over this caller's own (bounded) teaching roster, not a
+        database-level skip/limit - deliberately simple for a dataset this
+        scoped; revisit if a single teacher's roster ever grows large enough
+        to matter.
+        """
+        cohorts = await self.list_for_admin() if caller.role == Role.ADMINISTRATOR else await self.list_for_teacher(caller)
+        if cohort_id is not None:
+            cohorts = [c for c in cohorts if c.id == cohort_id]
+        if program_id is not None:
+            cohorts = [c for c in cohorts if c.program_id == program_id]
+        if not cohorts:
+            return [], 0
+
+        stage_map = {c.id: set(accessible_stage_ids(c, caller)) for c in cohorts}
+        cohort_by_id = {c.id: c for c in cohorts}
+        programs = await Program.find({"_id": {"$in": list({c.program_id for c in cohorts})}, "is_deleted": False}).to_list()
+        programs_by_id = {p.id: p for p in programs}
+
+        enrollments = await Enrollment.find({
+            "cohort_id": {"$in": list(cohort_by_id)},
+            "is_deleted": False,
+            "status": EnrollmentStatus.ACTIVE.value,
+        }).to_list()
+        enrollments = [e for e in enrollments if e.program_level_id in stage_map.get(e.cohort_id, set())]
+        if program_level_id is not None:
+            enrollments = [e for e in enrollments if e.program_level_id == program_level_id]
+
+        by_student: dict[str, list[Enrollment]] = {}
+        for enrollment in enrollments:
+            by_student.setdefault(enrollment.student_id, []).append(enrollment)
+        if not by_student:
+            return [], 0
+
+        students = await User.find({"_id": {"$in": list(by_student)}, "is_deleted": False}).to_list()
+        if search:
+            needle = search.strip().lower()
+            students = [s for s in students if needle in s.full_name.lower() or needle in s.email.lower()]
+        students.sort(key=lambda s: s.full_name.lower())
+        total = len(students)
+        start = (page - 1) * limit
+        page_students = students[start:start + limit]
+
+        rows = []
+        for student in page_students:
+            enriched = []
+            for enrollment in by_student[student.id]:
+                cohort = cohort_by_id.get(enrollment.cohort_id)
+                program = programs_by_id.get(enrollment.program_id)
+                stage = next(
+                    (lvl for lvl in self.program_service.effective_levels(program) if lvl.id == enrollment.program_level_id),
+                    None,
+                ) if program else None
+                enriched.append({
+                    "enrollment": enrollment,
+                    "program_name": program.name if program else None,
+                    "program_level_name": stage.name if stage else None,
+                    "cohort_name": cohort.name if cohort else None,
+                })
+            rows.append({"user": student, "enrollments": enriched})
+        return rows, total
 
 
 def get_cohort_service() -> CohortService:

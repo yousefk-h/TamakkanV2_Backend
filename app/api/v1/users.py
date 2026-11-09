@@ -23,6 +23,10 @@ from fastapi import APIRouter, Depends, Query
 from app.core.security import require_teacher_or_administrator
 from app.models.user import User
 from app.schema.alerts import StudentAlerts
+from app.schema.enrollment import EnrollmentPublic, TaughtStudent, TaughtStudentPage
+from app.schema.student_progress import ExerciseAttemptHistoryItem, StudentLearningJourney
+from app.services.cohort_service import CohortService, get_cohort_service
+from app.services.student_progress_service import StudentProgressService, get_student_progress_service
 from app.schema.user import (
     AssignPlan,
     CreateAccountRequest,
@@ -82,6 +86,82 @@ async def list_students(
     )
     items = [UserPublic.from_user(student) for student in students]
     return UserPage(items=items, total=total, page=current_page, limit=page_size) if paged else items
+
+
+@router.get("/users/my-students", response_model=TaughtStudentPage)
+async def list_my_students(
+    search: Optional[str] = Query(None, max_length=100),
+    program_id: Optional[str] = Query(None),
+    cohort_id: Optional[str] = Query(None),
+    program_level_id: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    caller: User = Depends(require_teacher_or_administrator),
+    service: CohortService = Depends(get_cohort_service),
+) -> TaughtStudentPage:
+    """The real "My Students" page: every Student with an active Enrollment
+    in a Cohort this caller actually teaches (Lead Teacher, or an
+    assigned-stage additional teacher - scoped to just their stages),
+    deduplicated across Cohorts/Programs. Deliberately distinct from
+    `GET /users` above, which lists students this caller *created* - a
+    different, narrower relationship; a teacher can be assigned to teach
+    students a different teacher or the Center Admin created, and this is
+    the endpoint that surfaces those. Center Admin sees every enrolled
+    student in the center.
+    """
+    rows, total = await service.list_my_students(
+        caller, search=search, program_id=program_id, cohort_id=cohort_id,
+        program_level_id=program_level_id, page=page, limit=limit,
+    )
+    items = [
+        TaughtStudent(
+            id=row["user"].id, full_name=row["user"].full_name, email=row["user"].email,
+            is_active=row["user"].is_active,
+            enrollments=[
+                EnrollmentPublic.from_enrollment(
+                    e["enrollment"], program_name=e["program_name"],
+                    program_level_name=e["program_level_name"], cohort_name=e["cohort_name"],
+                )
+                for e in row["enrollments"]
+            ],
+        )
+        for row in rows
+    ]
+    return TaughtStudentPage(items=items, total=total, page=page, limit=limit)
+
+
+@router.get("/users/{student_id}/learning-journey", response_model=StudentLearningJourney)
+async def get_student_learning_journey(
+    student_id: str,
+    caller: User = Depends(require_teacher_or_administrator),
+    service: StudentProgressService = Depends(get_student_progress_service),
+) -> StudentLearningJourney:
+    """The complete student learning journey (Teacher Workspace, Increment
+    2): every Program/Cohort enrollment, per-lesson progress and exercise
+    performance, AI practice history, and assigned homework - assembled
+    entirely from existing persisted records, never from an AI call.
+    Isolated per enrollment (two Programs/Cohorts never mix in the same
+    lesson list), and scoped to only the enrollments this caller is
+    actually authorized to see - the same reach rules as the Cohort
+    roster/`my-students` above, plus the existing `created_by_id`
+    ownership relationship.
+    """
+    return await service.get_learning_journey(student_id, caller)
+
+
+@router.get("/users/{student_id}/exercise-history", response_model=list[ExerciseAttemptHistoryItem])
+async def get_student_exercise_history(
+    student_id: str,
+    topic_id: str = Query(...),
+    enrollment_id: Optional[str] = Query(None),
+    caller: User = Depends(require_teacher_or_administrator),
+    service: StudentProgressService = Depends(get_student_progress_service),
+) -> list[ExerciseAttemptHistoryItem]:
+    """Every attempt a student submitted for one lesson, newest first -
+    including a superseded one, never silently dropped (see
+    `ExerciseAttempt.superseded`). This is the drill-down from
+    `get_student_learning_journey`'s per-exercise summary."""
+    return await service.get_exercise_history(student_id, topic_id, enrollment_id, caller)
 
 
 @router.get("/users/counts", response_model=StudentCounts)

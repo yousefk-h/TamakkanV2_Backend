@@ -19,6 +19,7 @@ from app.api.v1.health import router as health_router
 from app.api.v1.homework import router as homework_router
 from app.api.v1.level_profiles import router as level_profiles_router
 from app.api.v1.me import router as me_router
+from app.api.v1.messages import router as messages_router
 from app.api.v1.operations import router as operations_router
 from app.api.v1.programs import router as programs_router
 from app.api.v1.root import router as root_router
@@ -46,6 +47,7 @@ api_router.include_router(submissions_router, prefix="/v1", tags=["Submissions"]
 api_router.include_router(exercise_attempts_router, prefix="/v1", tags=["Exercise Answers"])
 api_router.include_router(homework_router, prefix="/v1", tags=["Homework"])
 api_router.include_router(level_profiles_router, prefix="/v1", tags=["Level Profiles"])
+api_router.include_router(messages_router, prefix="/v1", tags=["Messages"])
 api_router.include_router(programs_router, prefix="/v1", tags=["Programs"])
 api_router.include_router(cohorts_router, prefix="/v1", tags=["Cohorts"])
 api_router.include_router(enrollments_router, prefix="/v1", tags=["Enrollments"])
