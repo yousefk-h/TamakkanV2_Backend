@@ -20,8 +20,9 @@ from typing import Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
 
+from app.core.exceptions import NotFoundException
 from app.core.security import require_teacher_or_administrator
-from app.models.user import User
+from app.models.user import Role, User
 from app.schema.alerts import StudentAlerts
 from app.schema.enrollment import EnrollmentPublic, TaughtStudent, TaughtStudentPage
 from app.schema.student_progress import ExerciseAttemptHistoryItem, StudentLearningJourney
@@ -273,4 +274,29 @@ async def raise_session_limit(
     `AuditLog` entry.
     """
     student = await service.raise_session_limit(student_id, admin, body.duration_override_minutes)
+    return UserPublic.from_user(student)
+
+
+@router.get("/users/{student_id}", response_model=UserPublic)
+async def get_student(
+    student_id: str,
+    caller: User = Depends(require_teacher_or_administrator),
+    service: CohortService = Depends(get_cohort_service),
+) -> UserPublic:
+    """A single Student profile, authorized the same way "My Students" and
+    the Learning Journey already are (`CohortService.may_reach_student`) -
+    the existing `created_by_id` ownership relationship, OR an active
+    Enrollment in a Cohort this caller teaches. Fixes "View Profile"
+    returning a false "not found" for a Student a Teacher is actually
+    authorized to teach but didn't personally create: the Student Detail
+    page previously looked the student up only inside the `GET /users`
+    (created_by_id-scoped) roster already fetched client-side, which never
+    contained a Cohort-enrolled-only student at all - this is a real,
+    dedicated lookup instead.
+    """
+    student = await User.find_one({"_id": student_id, "is_deleted": False, "role": Role.STUDENT.value})
+    if student is None:
+        raise NotFoundException("Student not found")
+    if not await service.may_reach_student(caller, student):
+        raise NotFoundException("Student not found")
     return UserPublic.from_user(student)
