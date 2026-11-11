@@ -248,6 +248,33 @@ async def test_a_low_quality_draft_is_retried_once_then_succeeds(client):
     assert response.json()["exercises"][0]["prompt"] == "What does Maya do as part of her typical morning routine?"
 
 
+async def test_ai_can_draft_a_grounded_word_order_exercise(client):
+    """Slice 5: the AI exercise-drafting pipeline (and its Slice 4 quality
+    gate) accepts a well-grounded, correctly-shaped word_order suggestion."""
+    class FakeDrafter:
+        async def draft(self, **kwargs):
+            assert kwargs["kind"].value == "word_order"
+            return [LessonExerciseIn(
+                kind="word_order", prompt="Put the sentence in order.",
+                ordering_words=["Maya", "describes", "her", "typical", "morning", "routine"],
+            )]
+
+    token = await _login(client, Role.TEACHER, "ai-word-order@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her typical morning routine. " * 5
+    await stored.save()
+
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), FakeDrafter())
+    try:
+        response = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "word_order", "count": 1}, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+    assert response.status_code == 200, response.text
+    assert response.json()["exercises"][0]["ordering_words"] == ["Maya", "describes", "her", "typical", "morning", "routine"]
+
+
 async def test_a_persistently_low_quality_draft_is_rejected_not_retried_forever(client):
     """A drafter that NEVER produces a grounded exercise is rejected after
     exactly the bounded retry count - never saved, never an infinite loop."""

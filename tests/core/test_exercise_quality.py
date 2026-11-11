@@ -79,6 +79,22 @@ def test_content_excluded_by_the_center_policy_is_rejected():
     assert any(i.code == "content_policy" for i in issues)
 
 
+def test_a_word_order_exercise_is_graded_on_its_ordering_words_grounding():
+    exercise = LessonExercise(
+        kind=ExerciseKind.WORD_ORDER, prompt="Put the sentence in order.",
+        ordering_words=["Maya", "describes", "her", "typical", "morning", "routine"],
+    )
+    issues = validate_exercise_suggestion(exercise, source=SOURCE, objectives=[], level=Level.BEGINNER, siblings=[])
+    assert issues == []
+
+    ungrounded = LessonExercise(
+        kind=ExerciseKind.WORD_ORDER, prompt="Put the sentence in order.",
+        ordering_words=["The", "Eiffel", "Tower", "is", "in", "Paris"],
+    )
+    issues = validate_exercise_suggestion(ungrounded, source=SOURCE, objectives=[], level=Level.BEGINNER, siblings=[])
+    assert any(i.code == "ungrounded" for i in issues)
+
+
 def test_existing_exercises_for_duplicate_check_covers_both_published_and_pending():
     topic = TopicContent(title="t", level=Level.BEGINNER)
     published = _mc("Published question")

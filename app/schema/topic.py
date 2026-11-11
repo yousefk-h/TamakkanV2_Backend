@@ -147,6 +147,7 @@ class LessonExerciseIn(LessonExercise):
     media_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
     audio_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
     pairs: Annotated[list[ExercisePairIn], Field(max_length=8)] = Field(default_factory=list)
+    ordering_words: Annotated[list[Line], Field(max_length=20)] = Field(default_factory=list)
     min_words: Annotated[int, Field(ge=0, le=500)] = 0
     allow_resubmit: bool = True
     deadline_at: Optional[datetime] = None
@@ -171,6 +172,11 @@ class LessonExerciseIn(LessonExercise):
             raise ValueError("Only listening exercises accept an http(s) audio URL")
         if self.kind == ExerciseKind.GAME and (len(self.pairs) < 2 or any(not pair.left.strip() or not pair.right.strip() for pair in self.pairs)):
             raise ValueError("A matching game needs at least two complete pairs")
+        if self.kind == ExerciseKind.WORD_ORDER:
+            if len(self.ordering_words) < 2 or any(not word.strip() for word in self.ordering_words):
+                raise ValueError("A word-ordering exercise needs at least two non-empty words, in the correct order")
+        elif self.ordering_words:
+            raise ValueError("Only a word-ordering exercise can have ordering words")
         return self
 
 

@@ -82,3 +82,62 @@ async def test_student_answers_and_teacher_review_are_persisted_and_scoped(clien
     client.patch(f"/api/v1/topics/{topic_id}", json={"title": "Updated greetings"}, headers=teacher_headers)
     stale = client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": 1}, headers=student_headers)
     assert stale.status_code == 409
+
+
+async def test_word_order_exercise_is_authored_graded_and_persisted(client):
+    """Slice 5: Sentence Building / Word Ordering - schema validation,
+    deterministic grading (student must reconstruct the exact word order),
+    resubmission, and teacher-authored vs. malformed answers."""
+    teacher_token, teacher_id = await _login(client, "word-order-teacher@example.com", Role.TEACHER)
+    student_token, _ = await _login(client, "word-order-student@example.com", Role.STUDENT,
+                                    plan=PlanType.STANDARD, assigned_level=Level.BEGINNER,
+                                    program_start_date=utcnow(), created_by_id=teacher_id)
+    teacher_headers = {"Authorization": f"Bearer {teacher_token}"}
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+
+    # Schema validation: too few words, and options on a word_order exercise, are both rejected.
+    too_few = client.post("/api/v1/topics", json={
+        "title": "Order", "level": "beginner",
+        "lesson_exercises": [{"kind": "word_order", "prompt": "Order it", "ordering_words": ["one"]}],
+    }, headers=teacher_headers)
+    assert too_few.status_code == 422, too_few.text
+
+    with_options = client.post("/api/v1/topics", json={
+        "title": "Order", "level": "beginner",
+        "lesson_exercises": [{"kind": "word_order", "prompt": "Order it", "ordering_words": ["I", "like", "tea"],
+                              "options": ["a", "b"], "correct_option": 0}],
+    }, headers=teacher_headers)
+    assert with_options.status_code == 422, with_options.text
+
+    topic_response = client.post("/api/v1/topics", json={
+        "title": "Order", "level": "beginner",
+        "lesson_exercises": [{"kind": "word_order", "prompt": "Put the sentence in order.",
+                              "ordering_words": ["I", "like", "tea"], "allow_resubmit": True}],
+    }, headers=teacher_headers)
+    assert topic_response.status_code == 200, topic_response.text
+    topic_id = topic_response.json()["id"]
+    template = client.post("/api/v1/calendar-templates", json={"name": "Week 1", "kind": "standard", "level": "beginner", "days": [{"day": 1, "topic_ids": [topic_id]}]}, headers=teacher_headers)
+    assert client.post(f"/api/v1/calendar-templates/{template.json()['id']}/activate", headers=teacher_headers).status_code == 200
+
+    student_topic = client.get(f"/api/v1/topics/{topic_id}", headers=student_headers)
+    assert student_topic.status_code == 200
+    revision = student_topic.json()["updated_at"]
+    assert student_topic.json()["lesson_exercises"][0]["ordering_words"] == ["I", "like", "tea"]
+
+    # Malformed answers are rejected before any grading happens.
+    assert client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": [0, 0, 1]}, headers=student_headers).status_code == 422
+    assert client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": [0, 1]}, headers=student_headers).status_code == 422
+    assert client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": [0, 1, 5]}, headers=student_headers).status_code == 422
+
+    wrong = client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": [2, 1, 0]}, headers=student_headers)
+    assert wrong.status_code == 201, wrong.text
+    assert wrong.json()["correct"] is False
+    assert wrong.json()["score"] == 0
+    assert wrong.json()["answer_display"] == "tea like I"
+
+    correct = client.post("/api/v1/exercise-attempts", json={"topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision, "answer": [0, 1, 2]}, headers=student_headers)
+    assert correct.status_code == 201, correct.text
+    assert correct.json()["correct"] is True
+    assert correct.json()["score"] == 100
+    assert correct.json()["answer_display"] == "I like tea"
+    assert correct.json()["reviewed"] is True

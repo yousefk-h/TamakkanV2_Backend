@@ -17,8 +17,12 @@ from app.utils.time import utcnow
 
 ANSWER_KINDS = frozenset({ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.IMAGE_COMPLETION, ExerciseKind.LISTENING,
                           ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.GAME, ExerciseKind.WRITING,
-                          ExerciseKind.REFLECTION})
-CHOICE_KINDS = ANSWER_KINDS - {ExerciseKind.GAME, ExerciseKind.WRITING, ExerciseKind.REFLECTION}
+                          ExerciseKind.REFLECTION, ExerciseKind.WORD_ORDER})
+CHOICE_KINDS = ANSWER_KINDS - {ExerciseKind.GAME, ExerciseKind.WRITING, ExerciseKind.REFLECTION, ExerciseKind.WORD_ORDER}
+# Deterministically graded by index-list, same answer shape as GAME
+# (list[int]) but a different correctness rule: the student must reconstruct
+# the one correct order, not match unordered pairs.
+ORDER_KINDS = frozenset({ExerciseKind.WORD_ORDER})
 
 
 def exercise_hash(exercise: LessonExercise) -> str:
@@ -91,6 +95,16 @@ class ExerciseAttemptService:
                 raise UnprocessableException("Match each pair exactly once")
             correct = all(value == index for index, value in enumerate(answer))
             answer_display = "; ".join(f"{pair.left} → {exercise.pairs[answer[index]].right}" for index, pair in enumerate(exercise.pairs))
+            score = 100 if correct else 0
+            reviewed = True
+        elif exercise.kind in ORDER_KINDS:
+            word_count = len(exercise.ordering_words)
+            if (not isinstance(answer, list) or len(answer) != word_count
+                    or any(type(value) is not int or not 0 <= value < word_count for value in answer)
+                    or len(set(answer)) != len(answer)):
+                raise UnprocessableException("Arrange every word exactly once")
+            correct = answer == list(range(word_count))
+            answer_display = " ".join(exercise.ordering_words[i] for i in answer)
             score = 100 if correct else 0
             reviewed = True
         elif not isinstance(answer, str) or not answer.strip():

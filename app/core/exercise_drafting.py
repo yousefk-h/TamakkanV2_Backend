@@ -20,6 +20,7 @@ GENERATABLE_KINDS = frozenset({
     ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.REFLECTION, ExerciseKind.LISTENING,
     ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.WRITING,
     ExerciseKind.SPEAKING, ExerciseKind.GAME, ExerciseKind.SERIES,
+    ExerciseKind.WORD_ORDER,
 })
 
 SYSTEM_PROMPT = """You design language-learning exercises for a teacher to review.
@@ -34,9 +35,14 @@ spoken script in content. For reading, write a short passage in content. For
 grammar, put the rule in content and optional Arabic help in arabic_note. For a
 matching game, supply 2-6 correct left/right pairs; no options. For writing or
 speaking, use a specific task prompt; no answer key. For a series episode,
-write a short coherent episode in content. Do not produce video, vocabulary,
-or image-completion blocks: those require teacher media or the existing
-vocabulary drafting path. This is a draft, not content approved for students."""
+write a short coherent episode in content. For word_order (sentence building),
+pick ONE complete, grammatically correct sentence that genuinely appears in or
+is closely derived from the source material, and put its words, in their
+CORRECT reading order, as separate strings in ordering_words (split on spaces;
+keep punctuation attached to its word); no options, no pairs, no content. Do
+not produce video, vocabulary, or image-completion blocks: those require
+teacher media or the existing vocabulary drafting path. This is a draft, not
+content approved for students."""
 
 
 class DraftExerciseOutput(BaseModel):

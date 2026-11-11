@@ -124,6 +124,7 @@ class ExerciseKind(str, Enum):
     SERIES = "series"
     MULTIPLE_CHOICE = "multiple_choice"
     REFLECTION = "reflection"
+    WORD_ORDER = "word_order"
 
 
 class ExercisePair(BaseModel):
@@ -144,6 +145,12 @@ class LessonExercise(BaseModel):
     media_url: str = ""
     audio_url: str = ""
     pairs: list[ExercisePair] = Field(default_factory=list)
+    # Sentence Building / Word Ordering: the target sentence's words, stored
+    # in their CORRECT order - the student player shuffles them for display
+    # and the student reconstructs the order by selecting words in sequence.
+    # A submitted answer is the list of original indices in the order the
+    # student chose them; correct iff that equals range(len(ordering_words)).
+    ordering_words: list[str] = Field(default_factory=list)
     min_words: int = 0
     # Submission policy is part of the authored lesson, so it travels with a
     # pinned Topic revision and cannot be bypassed by a client-side checkbox.
