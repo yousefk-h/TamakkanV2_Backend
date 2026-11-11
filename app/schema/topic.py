@@ -35,6 +35,7 @@ from app.models.topic_content import (
     LessonExercise,
     LessonDraftExerciseSuggestion,
     LessonDraftJob,
+    LessonFlow,
     LearningObjective,
     ObjectiveSource,
     PracticeScheduleBlock,
@@ -206,6 +207,7 @@ class TopicCreate(BaseModel):
     # "legacy/unset", only "off until the teacher turns it on".
     arabic_support_enabled: bool = False
     arabic_intervention_level: ArabicInterventionLevel = ArabicInterventionLevel.LOW
+    lesson_flow: LessonFlow = LessonFlow.STANDARD
 
 
 class TopicUpdate(BaseModel):
@@ -232,6 +234,7 @@ class TopicUpdate(BaseModel):
     voice_prompt: Optional[Prompt] = None
     arabic_support_enabled: Optional[bool] = None
     arabic_intervention_level: Optional[ArabicInterventionLevel] = None
+    lesson_flow: Optional[LessonFlow] = None
 
 
 class LearningObjectiveIn(BaseModel):
@@ -448,6 +451,9 @@ class TopicPublic(BaseSchema):
     learning_objectives: list[LearningObjective] = Field(default_factory=list)
     objectives_approved: bool = False
     objective_drafts: list[LearningObjective] = Field(default_factory=list)
+    # Authoring-only flow configuration. Interactive Video is publish-gated
+    # until the real checkpoint player exists.
+    lesson_flow: Optional[LessonFlow] = None
     # AI-suggested exercises awaiting teacher review (Slice C) - same
     # disclosure rule as avatar_prompt/raw_transcript: a draft is authoring
     # material, never shown to a student. See LessonDraftExerciseSuggestion.
@@ -484,6 +490,7 @@ class TopicPublic(BaseSchema):
                 "learning_objectives": topic.learning_objectives,
                 "objectives_approved": topic.objectives_approved,
                 "objective_drafts": topic.objective_drafts,
+                "lesson_flow": topic.lesson_flow,
                 "draft_exercises": topic.draft_exercises,
                 "lesson_draft_job": topic.lesson_draft_job,
             }

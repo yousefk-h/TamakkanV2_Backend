@@ -157,3 +157,30 @@ async def test_one_topic_is_reused_in_two_programs_with_independent_placement(cl
     }, headers=teacher_headers)
     assert reassigned.status_code == 201, reassigned.text
     assert reassigned.json()["day"] is None
+
+
+async def test_interactive_video_flow_saves_but_cannot_be_published(client):
+    admin, admin_headers = await _login(client, "flow-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "flow-teacher@example.com", Role.TEACHER)
+    program = client.post("/api/v1/programs", json={
+        "code": "flow-program", "name": "Flow Program", "language": "English",
+        "base_levels": ["beginner"], "level_profile_ids": [],
+    }, headers=admin_headers).json()
+    topic = client.post("/api/v1/topics", json={
+        "title": "Interactive draft", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=teacher_headers)
+    assert topic.status_code == 200, topic.text
+    assert topic.json()["lesson_flow"] == "interactive_video"
+    blocked = client.post(f"/api/v1/programs/{program['id']}/topics", json={
+        "topic_id": topic.json()["id"], "program_level_id": "beginner", "status": "published",
+    }, headers=teacher_headers)
+    assert blocked.status_code == 422
+    assert "Interactive Video" in blocked.text
+    # Saving the design does not make the legacy Standard player unusable:
+    # switch explicitly, then the existing publish path is unchanged.
+    standard = client.patch(f"/api/v1/topics/{topic.json()['id']}", json={"lesson_flow": "standard"}, headers=teacher_headers)
+    assert standard.status_code == 200 and standard.json()["lesson_flow"] == "standard"
+    published = client.post(f"/api/v1/programs/{program['id']}/topics", json={
+        "topic_id": topic.json()["id"], "program_level_id": "beginner", "status": "published",
+    }, headers=teacher_headers)
+    assert published.status_code == 201, published.text

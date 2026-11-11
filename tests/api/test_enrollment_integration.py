@@ -159,6 +159,28 @@ async def test_two_enrollments_require_explicit_choice_and_stay_isolated(client)
     assert len(both_attempts) == 2 and all(not a.superseded for a in both_attempts)
 
 
+async def test_enrollment_topic_read_uses_its_program_pinned_revision(client):
+    admin, admin_headers = await _login(client, "revision-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "revision-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "revision-student@example.com", Role.STUDENT, created_by_id=admin.id)
+    program = _create_program(client, admin_headers, "revision-program", "Revision Program")
+    stage = _stage_id(program)
+    cohort = _create_cohort(client, admin_headers, name="Revision Batch", program=program, stage_id=stage, lead_teacher_id=teacher.id)
+    _enroll(client, admin_headers, cohort["id"], student.id, stage)
+    topic = _create_published_topic(client, teacher_headers, admin_headers, program, stage, "Pinned revision")
+    _schedule_topic_day1(client, admin_headers, _cohort_calendar_id(client, admin_headers, cohort["id"]), topic["id"])
+    changed = client.patch(f"/api/v1/topics/{topic['id']}", json={"title": "Unpublished revision"}, headers=teacher_headers)
+    assert changed.status_code == 200 and changed.json()["content_revision"] == 2
+    enrollment_id = client.get("/api/v1/enrollments/me", headers=student_headers).json()[0]["id"]
+    pinned = client.get(f"/api/v1/topics/{topic['id']}?enrollment_id={enrollment_id}", headers=student_headers)
+    assert pinned.status_code == 200 and pinned.json()["title"] == "Pinned revision"
+    assert pinned.json()["lesson_flow"] is None, "author-only flow metadata must not reach students"
+    republished = client.patch(f"/api/v1/programs/{program['id']}/topics/{topic['id']}", json={"status": "published"}, headers=teacher_headers)
+    assert republished.status_code == 200 and republished.json()["published_revision"] == 2
+    latest = client.get(f"/api/v1/topics/{topic['id']}?enrollment_id={enrollment_id}", headers=student_headers)
+    assert latest.status_code == 200 and latest.json()["title"] == "Unpublished revision"
+
+
 async def test_an_enrollment_id_belonging_to_another_student_is_rejected(client):
     admin, admin_headers = await _login(client, "ei-cross-admin@example.com", Role.ADMINISTRATOR)
     teacher, teacher_headers = await _login(client, "ei-cross-teacher@example.com", Role.TEACHER)

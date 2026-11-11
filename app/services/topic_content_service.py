@@ -21,7 +21,7 @@ from app.core.document_extraction import DocumentExtractionError, extract_docume
 from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
 from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage, get_lesson_audio_storage
 from app.core.youtube import fetch_video_duration_seconds
-from app.models.topic_content import LearningObjective, SourceDocument, SourceDocumentKind, TopicContent, TranscriptState
+from app.models.topic_content import LessonFlow, LearningObjective, SourceDocument, SourceDocumentKind, TopicContent, TranscriptState
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.level_profile import LevelProfile
 from app.models.user import Role, User
@@ -101,17 +101,32 @@ class TopicContentService:
         Program. Legacy/custom calendars fall back to the current revision.
         """
         program_id = enrollment_context.program_id if enrollment_context is not None else student.program_id
-        if not program_id:
-            return topic
-        placement = await ProgramTopic.find_one({
-            "program_id": program_id,
-            "topic_id": topic.id,
-            "status": ProgramTopicStatus.PUBLISHED.value,
-            "is_deleted": False,
-        })
-        if placement is None:
-            return topic
-        return topic.at_revision(placement.published_revision)
+        delivery = topic
+        if program_id:
+            placement_query = {
+                "program_id": program_id,
+                "topic_id": topic.id,
+                "status": ProgramTopicStatus.PUBLISHED.value,
+                "is_deleted": False,
+            }
+            # A live Enrollment's stage is part of the delivery identity. A
+            # similarly named Topic in another stage of the same Program must
+            # never select a revision for this student.
+            if enrollment_context is not None and enrollment_context.program_level_id:
+                placement_query["program_level_id"] = enrollment_context.program_level_id
+            placement = await ProgramTopic.find_one(placement_query)
+            if placement is None:
+                if enrollment_context is not None:
+                    raise ForbiddenException("This lesson is not published for your enrolled program stage")
+            else:
+                delivery = topic.at_revision(placement.published_revision)
+
+        # Interactive Video is deliberately author-only until its checkpoint
+        # timeline and playback implementation exists. This also protects any
+        # old/manual placement that predates the publication guard.
+        if delivery.lesson_flow == LessonFlow.INTERACTIVE_VIDEO:
+            raise ForbiddenException("Interactive Video lessons are not available to students yet")
+        return delivery
 
     async def _resolve_unit_id(self, unit_id: Optional[str], level, admin: User) -> Optional[str]:
         """Validates a client-given `unit_id` before it's ever trusted: the
