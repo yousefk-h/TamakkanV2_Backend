@@ -125,11 +125,26 @@ class ExerciseKind(str, Enum):
     MULTIPLE_CHOICE = "multiple_choice"
     REFLECTION = "reflection"
     WORD_ORDER = "word_order"
+    ERROR_CORRECTION = "error_correction"
+    DIALOGUE_COMPLETION = "dialogue_completion"
 
 
 class ExercisePair(BaseModel):
     left: str
     right: str
+
+
+class DialogueTurn(BaseModel):
+    """One line of a Dialogue Completion exercise. A non-blank turn is
+    shown to the student verbatim (`text`); a blank turn (`is_blank`) shows
+    only `speaker` and an input, and is graded against `accepted_answers` -
+    which is never sent to a Student (see `app.schema.topic
+    .mask_exercises_for_student`)."""
+
+    speaker: str
+    text: str = ""
+    is_blank: bool = False
+    accepted_answers: list[str] = Field(default_factory=list)
 
 
 class LessonExercise(BaseModel):
@@ -146,11 +161,19 @@ class LessonExercise(BaseModel):
     audio_url: str = ""
     pairs: list[ExercisePair] = Field(default_factory=list)
     # Sentence Building / Word Ordering: the target sentence's words, stored
-    # in their CORRECT order - the student player shuffles them for display
-    # and the student reconstructs the order by selecting words in sequence.
-    # A submitted answer is the list of original indices in the order the
-    # student chose them; correct iff that equals range(len(ordering_words)).
+    # in their CORRECT order. A Student never receives this order verbatim
+    # (see `app.schema.topic.mask_exercises_for_student`) and submits the
+    # chosen WORDS, in order, as the answer - never an index into any list.
     ordering_words: list[str] = Field(default_factory=list)
+    # Error Correction: `content` holds the INCORRECT sentence shown to the
+    # student; `accepted_answers` is every acceptable corrected version
+    # (never sent to a Student - see `mask_exercises_for_student`). A
+    # submission is graded by normalized exact match against any of them.
+    accepted_answers: list[str] = Field(default_factory=list)
+    # Dialogue Completion: a short multi-turn dialogue with one or more
+    # blank turns the student fills in. Each blank's own `accepted_answers`
+    # is never sent to a Student.
+    dialogue_turns: list[DialogueTurn] = Field(default_factory=list)
     min_words: int = 0
     # Submission policy is part of the authored lesson, so it travels with a
     # pinned Topic revision and cannot be bypassed by a client-side checkbox.

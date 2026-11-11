@@ -16,7 +16,10 @@ class ExerciseAttemptCreate(BaseModel):
     topic_id: str
     exercise_index: int = Field(ge=0, le=49)
     topic_updated_at: datetime
-    answer: StrictInt | AnswerText | list[StrictInt]
+    # list[StrictInt]: GAME's pair-match indices. list[AnswerText]: WORD_ORDER's
+    # chosen words, in order (never indices - see that kind's own note on why
+    # the client never sees a position that maps back to the true order).
+    answer: StrictInt | AnswerText | list[StrictInt] | Annotated[list[AnswerText], Field(max_length=20)]
     # Required only when the student has more than one active Enrollment -
     # see `EnrollmentService.resolve_context`. Omitted otherwise (0 or 1
     # active enrollment resolves unambiguously on its own).
@@ -37,7 +40,7 @@ class ExerciseAttemptPublic(BaseSchema):
     exercise_index: int
     exercise_kind: ExerciseKind
     exercise_prompt: str
-    answer: int | str | list[int]
+    answer: int | str | list[int] | list[str]
     answer_display: str
     correct: Optional[bool]
     correct_option: Optional[int]

@@ -275,6 +275,61 @@ async def test_ai_can_draft_a_grounded_word_order_exercise(client):
     assert response.json()["exercises"][0]["ordering_words"] == ["Maya", "describes", "her", "typical", "morning", "routine"]
 
 
+async def test_ai_can_draft_a_grounded_error_correction_exercise(client):
+    class FakeDrafter:
+        async def draft(self, **kwargs):
+            assert kwargs["kind"].value == "error_correction"
+            return [LessonExerciseIn(
+                kind="error_correction", prompt="Find and fix the mistake.",
+                content="Maya describe her typical morning routine every day.",
+                accepted_answers=["Maya describes her typical morning routine every day."],
+                explanation="Third-person singular present simple needs -s.",
+            )]
+
+    token = await _login(client, Role.TEACHER, "ai-error-correction@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her typical morning routine every day. " * 5
+    await stored.save()
+
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), FakeDrafter())
+    try:
+        response = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "error_correction", "count": 1}, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+    assert response.status_code == 200, response.text
+    assert response.json()["exercises"][0]["accepted_answers"] == ["Maya describes her typical morning routine every day."]
+
+
+async def test_ai_can_draft_a_grounded_dialogue_completion_exercise(client):
+    class FakeDrafter:
+        async def draft(self, **kwargs):
+            assert kwargs["kind"].value == "dialogue_completion"
+            return [LessonExerciseIn(
+                kind="dialogue_completion", prompt="Complete the dialogue about Maya's morning routine.",
+                dialogue_turns=[
+                    {"speaker": "Sam", "text": "What does Maya usually do every morning?"},
+                    {"speaker": "Alex", "is_blank": True, "accepted_answers": ["She describes her typical morning routine every day."]},
+                ],
+            )]
+
+    token = await _login(client, Role.TEACHER, "ai-dialogue@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her typical morning routine every day. " * 5
+    await stored.save()
+
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), FakeDrafter())
+    try:
+        response = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "dialogue_completion", "count": 1}, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+    assert response.status_code == 200, response.text
+    assert response.json()["exercises"][0]["dialogue_turns"][1]["is_blank"] is True
+
+
 async def test_a_persistently_low_quality_draft_is_rejected_not_retried_forever(client):
     """A drafter that NEVER produces a grounded exercise is rejected after
     exactly the bounded retry count - never saved, never an infinite loop."""

@@ -17,12 +17,24 @@ from app.utils.time import utcnow
 
 ANSWER_KINDS = frozenset({ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.IMAGE_COMPLETION, ExerciseKind.LISTENING,
                           ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.GAME, ExerciseKind.WRITING,
-                          ExerciseKind.REFLECTION, ExerciseKind.WORD_ORDER})
-CHOICE_KINDS = ANSWER_KINDS - {ExerciseKind.GAME, ExerciseKind.WRITING, ExerciseKind.REFLECTION, ExerciseKind.WORD_ORDER}
+                          ExerciseKind.REFLECTION, ExerciseKind.WORD_ORDER, ExerciseKind.ERROR_CORRECTION,
+                          ExerciseKind.DIALOGUE_COMPLETION})
+CHOICE_KINDS = ANSWER_KINDS - {ExerciseKind.GAME, ExerciseKind.WRITING, ExerciseKind.REFLECTION, ExerciseKind.WORD_ORDER,
+                               ExerciseKind.ERROR_CORRECTION, ExerciseKind.DIALOGUE_COMPLETION}
 # Deterministically graded by index-list, same answer shape as GAME
 # (list[int]) but a different correctness rule: the student must reconstruct
 # the one correct order, not match unordered pairs.
 ORDER_KINDS = frozenset({ExerciseKind.WORD_ORDER})
+
+
+def _normalize_answer_text(text: str) -> str:
+    """Reasonable normalization for comparing a free-text answer against a
+    teacher-approved accepted answer: trims, collapses internal whitespace,
+    lowercases, and drops one trailing sentence-ending punctuation mark -
+    none of that changes whether the ANSWER is right, only cosmetic
+    variation a teacher would not want to penalize."""
+    collapsed = " ".join(text.strip().split())
+    return collapsed.rstrip(".!?").strip().lower()
 
 
 def exercise_hash(exercise: LessonExercise) -> str:
@@ -89,23 +101,61 @@ class ExerciseAttemptService:
             score = 100 if correct else 0
             reviewed = True
         elif exercise.kind == ExerciseKind.GAME:
-            if (not isinstance(answer, list) or len(answer) != len(exercise.pairs)
-                    or any(type(value) is not int or not 0 <= value < len(exercise.pairs) for value in answer)
-                    or len(set(answer)) != len(answer)):
+            # Graded by the actual right-side TEXT the student chose for
+            # each left item, in left order - never by an index into the
+            # stored `pairs` (whose left[i]/right[i] correspondence IS the
+            # correct match, and is never sent to the student in that
+            # lockstep order; see `app.schema.topic.mask_exercises_for_student`).
+            true_rights = [pair.right.strip() for pair in exercise.pairs]
+            if (not isinstance(answer, list) or len(answer) != len(true_rights)
+                    or any(type(value) is not str for value in answer)
+                    or sorted(value.strip() for value in answer) != sorted(true_rights)):
                 raise UnprocessableException("Match each pair exactly once")
-            correct = all(value == index for index, value in enumerate(answer))
-            answer_display = "; ".join(f"{pair.left} → {exercise.pairs[answer[index]].right}" for index, pair in enumerate(exercise.pairs))
+            submitted = [value.strip() for value in answer]
+            correct = submitted == true_rights
+            answer_display = "; ".join(f"{pair.left} → {submitted[index]}" for index, pair in enumerate(exercise.pairs))
             score = 100 if correct else 0
             reviewed = True
         elif exercise.kind in ORDER_KINDS:
-            word_count = len(exercise.ordering_words)
-            if (not isinstance(answer, list) or len(answer) != word_count
-                    or any(type(value) is not int or not 0 <= value < word_count for value in answer)
-                    or len(set(answer)) != len(answer)):
-                raise UnprocessableException("Arrange every word exactly once")
-            correct = answer == list(range(word_count))
-            answer_display = " ".join(exercise.ordering_words[i] for i in answer)
+            # Graded by the actual WORDS submitted, in order - never by an
+            # index into the stored `ordering_words` (which is the true
+            # correct order and is never sent to the student; see
+            # `app.schema.topic.mask_exercises_for_student`). A submission
+            # must be a permutation of the real word set - anything else
+            # could only come from tampering, not from the shuffled list the
+            # student actually received, so it's a 422, not just "wrong".
+            true_words = [word.strip() for word in exercise.ordering_words]
+            if (not isinstance(answer, list) or len(answer) != len(true_words)
+                    or any(type(value) is not str for value in answer)
+                    or sorted(word.strip() for word in answer) != sorted(true_words)):
+                raise UnprocessableException("Submit each word from the exercise exactly once")
+            submitted = [word.strip() for word in answer]
+            correct = submitted == true_words
+            answer_display = " ".join(submitted)
             score = 100 if correct else 0
+            reviewed = True
+        elif exercise.kind == ExerciseKind.ERROR_CORRECTION:
+            if not isinstance(answer, str) or not answer.strip():
+                raise UnprocessableException("Write the corrected sentence before submitting")
+            submitted_norm = _normalize_answer_text(answer)
+            accepted_norm = {_normalize_answer_text(item) for item in exercise.accepted_answers}
+            correct = submitted_norm in accepted_norm
+            answer_display = answer.strip()
+            score = 100 if correct else 0
+            reviewed = True
+        elif exercise.kind == ExerciseKind.DIALOGUE_COMPLETION:
+            blanks = [turn for turn in exercise.dialogue_turns if turn.is_blank]
+            if (not isinstance(answer, list) or len(answer) != len(blanks)
+                    or any(type(value) is not str for value in answer)):
+                raise UnprocessableException("Fill in every blank turn before submitting")
+            submitted = [value.strip() for value in answer]
+            per_blank_correct = [
+                _normalize_answer_text(submitted[i]) in {_normalize_answer_text(a) for a in blank.accepted_answers}
+                for i, blank in enumerate(blanks)
+            ]
+            correct = all(per_blank_correct)
+            score = round(100 * sum(per_blank_correct) / len(blanks)) if blanks else 0
+            answer_display = " | ".join(submitted)
             reviewed = True
         elif not isinstance(answer, str) or not answer.strip():
             raise UnprocessableException("Write an answer before submitting")

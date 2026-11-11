@@ -60,7 +60,11 @@ def _exercise_text(exercise) -> str:
     """Every piece of text a reader would judge the exercise by - prompt,
     content, explanation and any options - so grounding/alignment/duplicate
     checks see the whole exercise, not just its question line."""
-    parts = [exercise.prompt, exercise.content, exercise.explanation, *exercise.options, *exercise.ordering_words]
+    parts = [
+        exercise.prompt, exercise.content, exercise.explanation, *exercise.options, *exercise.ordering_words,
+        *exercise.accepted_answers, *(turn.text for turn in exercise.dialogue_turns),
+        *(answer for turn in exercise.dialogue_turns for answer in turn.accepted_answers),
+    ]
     return " ".join(p for p in parts if p)
 
 

@@ -62,15 +62,57 @@ from app.services.topic_content_service import TopicContentService, get_topic_co
 from app.utils.time import utcnow
 
 # A small, bounded "starter pack" rather than every possible exercise kind -
-# predictable cost, and the three most broadly useful kinds for a first
-# draft (a comprehension check, a reading passage, a grammar point). A
-# teacher who wants more uses the existing per-card "AI draft" action
-# (ExerciseDraftService), which this slice leaves untouched.
+# predictable cost, always exactly 3 kinds. A teacher who wants more uses the
+# existing per-card "AI draft" action (ExerciseDraftService), which this
+# slice leaves untouched.
 DEFAULT_DRAFT_EXERCISE_KINDS: list[ExerciseKind] = [
     ExerciseKind.MULTIPLE_CHOICE,
     ExerciseKind.READING,
     ExerciseKind.GRAMMAR,
 ]
+
+# Every kind this bundle may ever choose from, most-general first - the
+# fallback order when a lesson has no approved objectives yet (or none of
+# them match a skill below) is exactly `DEFAULT_DRAFT_EXERCISE_KINDS`.
+_BALANCED_KIND_POOL: list[ExerciseKind] = [
+    ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.READING, ExerciseKind.GRAMMAR,
+    ExerciseKind.LISTENING, ExerciseKind.WORD_ORDER, ExerciseKind.ERROR_CORRECTION,
+    ExerciseKind.DIALOGUE_COMPLETION,
+]
+# A small, plain keyword vocabulary per skill - not a classifier, just enough
+# to notice when a Teacher's own approved objective already names a skill
+# (e.g. "listen", "pronunciation") this bundle could usefully cover, so the
+# 3 chosen kinds lean toward what THIS lesson is actually for rather than
+# always being the same 3 regardless of objective. Kinds absent here
+# (MULTIPLE_CHOICE) are the general-purpose fallback, never prioritized by
+# keyword match alone.
+_SKILL_KEYWORDS: dict[ExerciseKind, frozenset[str]] = {
+    ExerciseKind.LISTENING: frozenset({"listen", "hear", "pronunciation", "audio"}),
+    ExerciseKind.DIALOGUE_COMPLETION: frozenset({"conversation", "dialogue", "discuss", "respond", "ask"}),
+    ExerciseKind.ERROR_CORRECTION: frozenset({"correct", "accuracy", "mistake"}),
+    ExerciseKind.WORD_ORDER: frozenset({"sentence", "structure", "word order"}),
+    ExerciseKind.READING: frozenset({"read", "passage", "comprehen"}),
+    ExerciseKind.GRAMMAR: frozenset({"grammar", "tense", "rule"}),
+}
+
+
+def _balanced_default_kinds(topic: TopicContent) -> list[ExerciseKind]:
+    """The 3 kinds this run targets, same count every time (never padded to
+    backfill a skipped already-authored one - see `_plan`): the stable
+    default bundle when there are no approved objectives yet to go on,
+    otherwise the 3 kinds from `_BALANCED_KIND_POOL` whose skill keywords
+    best match the lesson's own approved objectives, covering more of
+    reading/listening/grammar/production/conversation than a fixed MC-heavy
+    default would."""
+    objective_text = " ".join(o.text.lower() for o in topic.learning_objectives if o.text)
+    if not objective_text:
+        return list(DEFAULT_DRAFT_EXERCISE_KINDS)
+    matched = [
+        kind for kind in _BALANCED_KIND_POOL
+        if kind in _SKILL_KEYWORDS and any(word in objective_text for word in _SKILL_KEYWORDS[kind])
+    ]
+    rest = [kind for kind in _BALANCED_KIND_POOL if kind not in matched]
+    return (matched + rest)[:3]
 
 # One bounded retry when a drafted exercise fails the quality gate - never
 # unbounded, and the retry is itself a normal cost-tracked/budget-checked
@@ -110,7 +152,7 @@ class LessonDraftService:
         """
         needs_content = not _content_already_filled(topic)
         existing = _existing_kinds(topic)
-        needs_exercise_kinds = [kind for kind in DEFAULT_DRAFT_EXERCISE_KINDS if kind not in existing]
+        needs_exercise_kinds = [kind for kind in _balanced_default_kinds(topic) if kind not in existing]
         return needs_content, needs_exercise_kinds
 
     async def start(self, topic_id: str, teacher: User) -> TopicContent:

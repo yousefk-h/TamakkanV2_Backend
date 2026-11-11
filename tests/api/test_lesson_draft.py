@@ -107,11 +107,34 @@ async def test_generate_lesson_draft_fills_content_and_drafts_default_exercise_k
     assert set(final["lesson_draft_job"]["exercise_steps"].values()) == {"done"}
     assert len(final["draft_exercises"]) == 3
     assert {item["kind"] for item in final["draft_exercises"]} == {"multiple_choice", "reading", "grammar"}
-    # Nothing was published without explicit teacher approval.
+
+
+async def test_generate_lesson_draft_leans_toward_skills_the_objectives_actually_name(client):
+    """Slice 5 balance: with no objectives, the bundle is the stable
+    [multiple_choice, reading, grammar] default (asserted above) - an
+    approved objective naming a different skill (here, listening) swaps one
+    slot for it instead of always drafting the same 3 kinds regardless."""
+    token = await _login(client, Role.TEACHER, "lesson-draft-balance@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic_id = await _topic_with_approved_source(client, headers)
+    saved = client.put(f"/api/v1/topics/{topic_id}/objectives", json={"objectives": [
+        {"text": "Practice listening to understand Maya's typical morning routine in detail.", "source": "manual"},
+    ]}, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert client.post(f"/api/v1/topics/{topic_id}/objectives/approve", headers=headers).status_code == 200
+
+    _override_lesson_draft_service()
+    try:
+        resp = client.post(f"/api/v1/topics/{topic_id}/generate-lesson-draft", headers=headers)
+        assert resp.status_code == 202, resp.text
+    finally:
+        app.dependency_overrides.pop(get_lesson_draft_service, None)
+
+    final = client.get(f"/api/v1/topics/{topic_id}", headers=headers).json()
+    assert final["lesson_draft_job"]["state"] == "done"
+    assert {item["kind"] for item in final["draft_exercises"]} == {"listening", "multiple_choice", "reading"}
+    assert "grammar" not in {item["kind"] for item in final["draft_exercises"]}
     assert final["lesson_exercises"] == []
-    assert sorted(exercise_drafter.calls, key=lambda k: k.value) == sorted(
-        [ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.READING, ExerciseKind.GRAMMAR], key=lambda k: k.value
-    )
 
 
 async def test_generate_lesson_draft_skips_content_step_when_already_filled(client):

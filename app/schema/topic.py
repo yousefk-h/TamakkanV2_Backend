@@ -19,6 +19,7 @@ once entitlement landed in cards #14/#15, and was never true of the AI's own
 prompt text.
 """
 
+import hashlib
 from datetime import datetime
 from typing import Annotated, Optional
 from urllib.parse import urlparse
@@ -28,6 +29,7 @@ from pydantic import AfterValidator, BaseModel, Field, model_validator
 from app.core.youtube import derive_thumbnail_url, extract_video_id
 from app.models.topic_content import (
     ArabicInterventionLevel,
+    DialogueTurn,
     GuidedQuestionPart,
     ExerciseKind,
     ExercisePair,
@@ -138,6 +140,12 @@ class ExercisePairIn(ExercisePair):
     right: Line
 
 
+class DialogueTurnIn(DialogueTurn):
+    speaker: Annotated[str, Field(min_length=1, max_length=100)]
+    text: Annotated[str, Field(max_length=MAX_LINE_LENGTH)] = ""
+    accepted_answers: Annotated[list[Line], Field(max_length=5)] = Field(default_factory=list)
+
+
 class LessonExerciseIn(LessonExercise):
     prompt: Annotated[str, Field(min_length=1, max_length=MAX_LINE_LENGTH)]
     options: Annotated[list[Line], Field(max_length=6)] = Field(default_factory=list)
@@ -148,6 +156,8 @@ class LessonExerciseIn(LessonExercise):
     audio_url: Annotated[str, Field(max_length=MAX_URL_LENGTH)] = ""
     pairs: Annotated[list[ExercisePairIn], Field(max_length=8)] = Field(default_factory=list)
     ordering_words: Annotated[list[Line], Field(max_length=20)] = Field(default_factory=list)
+    accepted_answers: Annotated[list[Line], Field(max_length=10)] = Field(default_factory=list)
+    dialogue_turns: Annotated[list[DialogueTurnIn], Field(max_length=20)] = Field(default_factory=list)
     min_words: Annotated[int, Field(ge=0, le=500)] = 0
     allow_resubmit: bool = True
     deadline_at: Optional[datetime] = None
@@ -177,6 +187,25 @@ class LessonExerciseIn(LessonExercise):
                 raise ValueError("A word-ordering exercise needs at least two non-empty words, in the correct order")
         elif self.ordering_words:
             raise ValueError("Only a word-ordering exercise can have ordering words")
+        if self.kind == ExerciseKind.ERROR_CORRECTION:
+            if not self.content.strip():
+                raise ValueError("Error correction needs the incorrect sentence in content")
+            if not self.accepted_answers or any(not answer.strip() for answer in self.accepted_answers):
+                raise ValueError("Error correction needs at least one accepted corrected answer")
+        elif self.accepted_answers:
+            raise ValueError("Only an error-correction exercise can have accepted_answers")
+        if self.kind == ExerciseKind.DIALOGUE_COMPLETION:
+            blanks = [turn for turn in self.dialogue_turns if turn.is_blank]
+            if len(self.dialogue_turns) < 2:
+                raise ValueError("A dialogue needs at least two turns")
+            if not blanks:
+                raise ValueError("A dialogue needs at least one blank turn for the student to complete")
+            if any(not turn.accepted_answers or any(not answer.strip() for answer in turn.accepted_answers) for turn in blanks):
+                raise ValueError("Every blank turn needs at least one accepted answer")
+            if any(not turn.is_blank and not turn.text.strip() for turn in self.dialogue_turns):
+                raise ValueError("A non-blank dialogue turn needs its line of text")
+        elif self.dialogue_turns:
+            raise ValueError("Only a dialogue-completion exercise can have dialogue_turns")
         return self
 
 
@@ -316,6 +345,82 @@ def resolve_thumbnail_url(topic: TopicContent) -> Optional[str]:
     if topic.youtube_urls:
         return derive_thumbnail_url(topic.youtube_urls[0])
     return None
+
+
+def _scrambled_order(count: int, seed: int) -> list[int]:
+    """Deterministic shuffle (small seeded PRNG, not `random` - reproducible
+    per exercise, not per-process) of `range(count)`, guaranteed to differ
+    from the identity order when there's room to. Used only for STUDENT-
+    facing delivery of a word-ordering exercise: the server must never send
+    the true correct order to the client (see `mask_exercises_for_student`'s
+    own docstring on why) - this is the harmless-to-reveal scrambled
+    presentation order instead.
+    """
+    order = list(range(count))
+    state = seed or 1
+    for i in range(count - 1, 0, -1):
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        j = state % (i + 1)
+        order[i], order[j] = order[j], order[i]
+    if count > 1 and order == list(range(count)):
+        order[0], order[1] = order[1], order[0]
+    return order
+
+
+def _stable_seed(topic_id: str, index: int, salt: str) -> int:
+    # `hash()` on a str is randomized per process (PYTHONHASHSEED) - this
+    # must stay stable across requests/restarts so a Student's in-progress
+    # (unsubmitted) arrangement isn't rescrambled out from under them on a
+    # mere refetch.
+    digest = hashlib.sha256(f"{topic_id}:{index}:{salt}".encode()).digest()
+    return (int.from_bytes(digest[:4], "big") & 0x7FFFFFFF) or 1
+
+
+def mask_exercises_for_student(topic_id: str, lesson_exercises: list[LessonExercise]) -> list[LessonExercise]:
+    """Every field that would hand a Student the answer before they submit
+    must be stripped or scrambled here, in ONE place:
+
+    - `correct_option` (multiple-choice-shaped kinds) is nulled.
+    - `ordering_words` (word ordering) is replaced with a scrambled
+      PRESENTATION order rather than the stored correct order, which
+      otherwise *is* the answer key.
+    - `pairs` (matching game) has its `right` side permuted across pair
+      slots - the stored `pairs[i].left`/`pairs[i].right` correspondence
+      *is* the correct match, and sending both lists in lockstep let a
+      Student simply read the API response and pair same-index items
+      without doing the activity.
+    - `accepted_answers` (error correction) is emptied - it IS the answer
+      key, in full.
+    - Each blank `dialogue_turns[i].accepted_answers` (dialogue completion)
+      is emptied, same reasoning, turn by turn.
+
+    Grading (`ExerciseAttemptService`) always re-reads the real, unmasked
+    document from the database - this function only ever affects what a
+    Student's own `GET /topics/{id}` response contains.
+    """
+    masked: list[LessonExercise] = []
+    for index, exercise in enumerate(lesson_exercises):
+        updates: dict = {"correct_option": None}
+        if exercise.kind == ExerciseKind.WORD_ORDER and exercise.ordering_words:
+            seed = _stable_seed(topic_id, index, "order")
+            order = _scrambled_order(len(exercise.ordering_words), seed)
+            updates["ordering_words"] = [exercise.ordering_words[i] for i in order]
+        if exercise.kind == ExerciseKind.GAME and exercise.pairs:
+            seed = _stable_seed(topic_id, index, "game")
+            order = _scrambled_order(len(exercise.pairs), seed)
+            rights = [exercise.pairs[i].right for i in order]
+            updates["pairs"] = [
+                exercise.pairs[i].model_copy(update={"right": rights[i]}) for i in range(len(exercise.pairs))
+            ]
+        if exercise.kind == ExerciseKind.ERROR_CORRECTION:
+            updates["accepted_answers"] = []
+        if exercise.kind == ExerciseKind.DIALOGUE_COMPLETION and exercise.dialogue_turns:
+            updates["dialogue_turns"] = [
+                turn.model_copy(update={"accepted_answers": []}) if turn.is_blank else turn
+                for turn in exercise.dialogue_turns
+            ]
+        masked.append(exercise.model_copy(update=updates))
+    return masked
 
 
 class TopicListItem(BaseSchema):
@@ -525,9 +630,7 @@ class TopicPublic(BaseSchema):
             vocabulary=topic.vocabulary,
             sentence_starters=topic.sentence_starters,
             suggested_practice_schedule=topic.suggested_practice_schedule,
-            lesson_exercises=topic.lesson_exercises if include_internal else [
-                exercise.model_copy(update={"correct_option": None}) for exercise in topic.lesson_exercises
-            ],
+            lesson_exercises=topic.lesson_exercises if include_internal else mask_exercises_for_student(topic.id, topic.lesson_exercises),
             opening_line=topic.opening_line,
             # Unlike `raw_transcript`, this is meant for a Student to read once
             # a teacher has approved it - it's `None` until that happens

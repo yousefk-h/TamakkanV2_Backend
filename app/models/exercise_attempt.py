@@ -24,7 +24,7 @@ class ExerciseAttempt(BaseDocument):
     exercise_hash: str
     exercise_kind: ExerciseKind
     exercise_prompt: str
-    answer: int | str | list[int]
+    answer: int | str | list[int] | list[str]
     answer_display: str
     correct: Optional[bool] = None
     correct_option: Optional[int] = None

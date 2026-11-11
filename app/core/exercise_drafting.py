@@ -20,7 +20,7 @@ GENERATABLE_KINDS = frozenset({
     ExerciseKind.MULTIPLE_CHOICE, ExerciseKind.REFLECTION, ExerciseKind.LISTENING,
     ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.WRITING,
     ExerciseKind.SPEAKING, ExerciseKind.GAME, ExerciseKind.SERIES,
-    ExerciseKind.WORD_ORDER,
+    ExerciseKind.WORD_ORDER, ExerciseKind.ERROR_CORRECTION, ExerciseKind.DIALOGUE_COMPLETION,
 })
 
 SYSTEM_PROMPT = """You design language-learning exercises for a teacher to review.
@@ -39,10 +39,20 @@ write a short coherent episode in content. For word_order (sentence building),
 pick ONE complete, grammatically correct sentence that genuinely appears in or
 is closely derived from the source material, and put its words, in their
 CORRECT reading order, as separate strings in ordering_words (split on spaces;
-keep punctuation attached to its word); no options, no pairs, no content. Do
-not produce video, vocabulary, or image-completion blocks: those require
-teacher media or the existing vocabulary drafting path. This is a draft, not
-content approved for students."""
+keep punctuation attached to its word); no options, no pairs, no content. For
+error_correction, write ONE naturally plausible INCORRECT sentence (a realistic
+learner mistake - grammar, tense, word order, agreement, or word choice, never
+a trivially obvious typo) in content, and give 1-3 accepted_answers that are
+each a fully corrected version of that exact sentence (minor acceptable
+phrasing variants only, not different sentences); put the grammar point being
+tested in explanation; no options, no pairs. For dialogue_completion, write 3-6
+dialogue_turns forming one short, coherent, realistic exchange grounded in the
+lesson - most turns have only speaker and text; mark exactly 1-2 turns
+is_blank=true with text left empty and 1-3 accepted_answers each (short, natural
+things a speaker could say there, not single words unless the context is that
+narrow); the first turn is never blank. Do not produce video, vocabulary, or
+image-completion blocks: those require teacher media or the existing
+vocabulary drafting path. This is a draft, not content approved for students."""
 
 
 class DraftExerciseOutput(BaseModel):
