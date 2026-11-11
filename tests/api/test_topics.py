@@ -184,8 +184,11 @@ async def test_ai_exercise_draft_is_grounded_teacher_scoped_and_not_saved(client
             assert "morning routine" in kwargs["source"]
             assert kwargs["kind"].value == "reading"
             assert kwargs["count"] == 1
-            return [LessonExerciseIn(kind="reading", prompt="When does Maya leave?", content="Maya leaves at eight.",
-                                     options=["At eight", "At ten"], correct_option=0)]
+            return [LessonExerciseIn(
+                kind="reading", prompt="What does Maya describe about her morning routine?",
+                content="Maya describes her typical morning routine in the passage.",
+                options=["Her morning routine", "Her evening routine"], correct_option=0,
+            )]
 
     teacher_token = await _login(client, Role.TEACHER, "ai-exercise-teacher@example.com")
     other_token = await _login(client, Role.TEACHER, "ai-exercise-other@example.com")
@@ -204,7 +207,76 @@ async def test_ai_exercise_draft_is_grounded_teacher_scoped_and_not_saved(client
     finally:
         app.dependency_overrides.pop(get_exercise_draft_service, None)
     assert response.status_code == 200
-    assert response.json()["exercises"][0]["prompt"] == "When does Maya leave?"
+    assert response.json()["exercises"][0]["prompt"] == "What does Maya describe about her morning routine?"
+    assert client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()["lesson_exercises"] == []
+
+
+async def test_a_low_quality_draft_is_retried_once_then_succeeds(client):
+    """Slice 4: the quality gate rejects an ungrounded/trivial first attempt;
+    the service retries once (its one bounded retry), and a genuinely better
+    second attempt is accepted and returned."""
+    class FlakyDrafter:
+        def __init__(self):
+            self.attempts = 0
+
+        async def draft(self, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                return [LessonExerciseIn(kind="reading", prompt="What is the capital of France?",
+                                         content="Paris.", options=["Paris", "Lyon"], correct_option=0)]
+            return [LessonExerciseIn(
+                kind="reading", prompt="What does Maya do as part of her typical morning routine?",
+                content="Maya describes her typical morning routine in detail.",
+                options=["Her morning routine", "Nothing relevant"], correct_option=0,
+            )]
+
+    token = await _login(client, Role.TEACHER, "ai-exercise-retry@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her typical morning routine. " * 5
+    await stored.save()
+
+    drafter = FlakyDrafter()
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), drafter)
+    try:
+        response = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "reading", "count": 1}, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+    assert response.status_code == 200, response.text
+    assert drafter.attempts == 2
+    assert response.json()["exercises"][0]["prompt"] == "What does Maya do as part of her typical morning routine?"
+
+
+async def test_a_persistently_low_quality_draft_is_rejected_not_retried_forever(client):
+    """A drafter that NEVER produces a grounded exercise is rejected after
+    exactly the bounded retry count - never saved, never an infinite loop."""
+    class AlwaysBadDrafter:
+        def __init__(self):
+            self.attempts = 0
+
+        async def draft(self, **kwargs):
+            self.attempts += 1
+            return [LessonExerciseIn(kind="reading", prompt="What is the capital of France?",
+                                     content="Paris.", options=["Paris", "Lyon"], correct_option=0)]
+
+    token = await _login(client, Role.TEACHER, "ai-exercise-always-bad@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Routine", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "Maya describes her typical morning routine. " * 5
+    await stored.save()
+
+    drafter = AlwaysBadDrafter()
+    app.dependency_overrides[get_exercise_draft_service] = lambda: ExerciseDraftService(get_topic_content_service(), drafter)
+    try:
+        response = client.post(f"/api/v1/topics/{topic['id']}/draft-exercises", json={"kind": "reading", "count": 1}, headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_exercise_draft_service, None)
+    assert response.status_code == 502, response.text
+    assert "quality" in response.text.lower() or "ungrounded" in response.text.lower()
+    # Bounded: exactly 2 attempts (MAX_DRAFT_ATTEMPTS), never an unbounded retry loop.
+    assert drafter.attempts == 2
     assert client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()["lesson_exercises"] == []
 
 
@@ -320,7 +392,11 @@ async def test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request(c
 async def test_exercise_draft_enforces_the_per_topic_daily_budget(client, monkeypatch):
     class FakeDrafter:
         async def draft(self, **kwargs):
-            return [LessonExerciseIn(kind="reading", prompt="Q", content="C", options=["A", "B"], correct_option=0)]
+            return [LessonExerciseIn(
+                kind="reading", prompt="What does Maya do every morning in her routine?",
+                content="Maya describes her morning routine in detail.",
+                options=["Her morning routine", "Nothing at all"], correct_option=0,
+            )]
 
     from app.core.config import get_settings as _get_settings
 

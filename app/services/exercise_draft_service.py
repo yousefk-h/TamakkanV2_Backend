@@ -14,11 +14,17 @@ from app.core.ai_cost_control import (
 from app.core.config import get_settings
 from app.core.exceptions import ServiceUnavailableException, UnprocessableException, UpstreamServiceException
 from app.core.exercise_drafting import ExerciseDrafter, ExerciseDraftingError, ExerciseDraftingNotConfigured, GENERATABLE_KINDS, MODEL, get_exercise_drafter
+from app.core.exercise_quality import existing_exercises_for_duplicate_check, validate_exercise_suggestion
 from app.models.ai_generation import AIGenerationType
 from app.models.topic_content import ExerciseKind
 from app.models.user import User
 from app.schema.topic import LessonExerciseIn
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
+
+# One bounded retry when the first batch fails quality validation - never
+# unbounded, and the retry is itself a normal cost-tracked/budget-checked
+# generation (see `ai_cost_control.claim_generation`), not a free extra call.
+MAX_DRAFT_ATTEMPTS = 2
 
 
 class DraftExercisesRequest(BaseModel):
@@ -52,59 +58,99 @@ class ExerciseDraftService:
         # .MAX_DRAFTING_SOURCE_CHARS), not the older hardcoded 16000 - one
         # configurable ceiling for every drafting call site.
         bounded_source = source[: get_settings().MAX_DRAFTING_SOURCE_CHARS]
+        objective_texts = [o.text for o in topic.learning_objectives]
+        siblings = existing_exercises_for_duplicate_check(topic)
 
-        generation_key = compute_generation_key(
-            AIGenerationType.EXERCISE_DRAFT,
-            topic_id=topic_id,
-            kind=body.kind.value,
-            count=body.count,
-            focus=body.focus,
-            content=body.content,
-            source=bounded_source,
-            model=MODEL,
-        )
-        # Blocks only a genuinely concurrent duplicate (a double-click, a
-        # retried request that reached the server twice) - see
-        # `app.core.ai_cost_control.claim_generation`'s own docstring on why
-        # a later, sequential identical request is never blocked: nothing
-        # from a draft call is persisted anywhere (the teacher still
-        # reviews/accepts), so there is no stale cached result to return
-        # instead, and "draft this same kind again" is a legitimate,
-        # explicit teacher action, not waste.
-        claim = await claim_generation(
-            generation_type=AIGenerationType.EXERCISE_DRAFT,
-            generation_key=generation_key,
-            model=MODEL,
-            topic_id=topic_id,
-            requested_by_id=teacher.id,
-        )
-
-        started = time.perf_counter()
-        try:
-            exercises = await self.drafter.draft(title=topic.title, level=topic.level, source=bounded_source,
-                                                  kind=body.kind, count=body.count, focus=body.focus,
-                                                  content=body.content)
-            if len(exercises) != body.count or any(item.kind != body.kind for item in exercises):
-                raise ExerciseDraftingError("Provider returned the wrong exercise type or count")
-            if body.content and body.kind in {ExerciseKind.LISTENING, ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.SERIES}:
-                exercises = [item.model_copy(update={"content": body.content}) for item in exercises]
-            usage = getattr(self.drafter, "last_usage", None)
-            await complete_generation(
-                claim,
-                input_tokens=getattr(usage, "input_tokens", None),
-                output_tokens=getattr(usage, "output_tokens", None),
+        last_issues: list[str] = []
+        for attempt in range(1, MAX_DRAFT_ATTEMPTS + 1):
+            # Each attempt is its own tracked generation - a retry is a real,
+            # separate provider call, never a free re-ask, and still subject
+            # to the same per-topic daily budget as any other request.
+            generation_key = compute_generation_key(
+                AIGenerationType.EXERCISE_DRAFT,
+                topic_id=topic_id,
+                kind=body.kind.value,
+                count=body.count,
+                focus=body.focus,
+                content=body.content,
+                source=bounded_source,
+                model=MODEL,
+                # Omitted on the first attempt so the key is byte-for-byte
+                # the pre-Slice-4 one - an external caller computing the same
+                # key to detect a genuinely concurrent duplicate (see
+                # test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request)
+                # must still match it.
+                **({"attempt": attempt} if attempt > 1 else {}),
             )
-            logger.info("exercise_draft success topic_id={} kind={} count={} latency_ms={:.0f} model={}",
-                        topic_id, body.kind.value, len(exercises), (time.perf_counter() - started) * 1000, MODEL)
-            return DraftExercisesResponse(exercises=exercises)
-        except ExerciseDraftingNotConfigured as exc:
-            await fail_generation(claim, exc)
-            raise ServiceUnavailableException("AI exercise drafting is not configured in this development environment") from exc
-        except ExerciseDraftingError as exc:
-            await fail_generation(claim, exc)
-            logger.warning("exercise_draft failure topic_id={} kind={} latency_ms={:.0f} error={}",
-                           topic_id, body.kind.value, (time.perf_counter() - started) * 1000, type(exc).__name__)
-            raise UpstreamServiceException("AI could not draft this skill. Try again or write it manually.") from exc
+            claim = await claim_generation(
+                generation_type=AIGenerationType.EXERCISE_DRAFT,
+                generation_key=generation_key,
+                model=MODEL,
+                topic_id=topic_id,
+                requested_by_id=teacher.id,
+            )
+            started = time.perf_counter()
+            retry_focus = body.focus if attempt == 1 else (
+                f"{body.focus} (Previous attempt was rejected for: {'; '.join(last_issues)}. "
+                "Write clearly different, better-grounded questions this time.)"
+            ).strip()
+            try:
+                exercises = await self.drafter.draft(title=topic.title, level=topic.level, source=bounded_source,
+                                                      kind=body.kind, count=body.count, focus=retry_focus,
+                                                      content=body.content)
+                if len(exercises) != body.count or any(item.kind != body.kind for item in exercises):
+                    raise ExerciseDraftingError("Provider returned the wrong exercise type or count")
+                if body.content and body.kind in {ExerciseKind.LISTENING, ExerciseKind.GRAMMAR, ExerciseKind.READING, ExerciseKind.SERIES}:
+                    exercises = [item.model_copy(update={"content": body.content}) for item in exercises]
+
+                batch_issues: list[str] = []
+                validated_so_far: list = []
+                for item in exercises:
+                    issues = validate_exercise_suggestion(
+                        item, source=bounded_source, objectives=objective_texts,
+                        level=topic.level, siblings=siblings + validated_so_far,
+                    )
+                    if issues:
+                        batch_issues.extend(f"{i.code}: {i.message}" for i in issues)
+                    else:
+                        validated_so_far.append(item)
+
+                usage = getattr(self.drafter, "last_usage", None)
+                if batch_issues:
+                    await fail_generation(claim, ExerciseDraftingError("; ".join(batch_issues)))
+                    last_issues = batch_issues
+                    logger.warning(
+                        "exercise_draft quality-rejected topic_id={} kind={} attempt={} issues={}",
+                        topic_id, body.kind.value, attempt, batch_issues,
+                    )
+                    if attempt < MAX_DRAFT_ATTEMPTS:
+                        continue
+                    raise UpstreamServiceException(
+                        "AI could not draft a high-quality exercise for this skill after a retry "
+                        f"({'; '.join(batch_issues)}). Try again with a different focus, or write it manually."
+                    )
+
+                await complete_generation(
+                    claim,
+                    input_tokens=getattr(usage, "input_tokens", None),
+                    output_tokens=getattr(usage, "output_tokens", None),
+                )
+                logger.info("exercise_draft success topic_id={} kind={} count={} attempt={} latency_ms={:.0f} model={}",
+                            topic_id, body.kind.value, len(exercises), attempt, (time.perf_counter() - started) * 1000, MODEL)
+                return DraftExercisesResponse(exercises=exercises)
+            except ExerciseDraftingNotConfigured as exc:
+                await fail_generation(claim, exc)
+                raise ServiceUnavailableException("AI exercise drafting is not configured in this development environment") from exc
+            except ExerciseDraftingError as exc:
+                await fail_generation(claim, exc)
+                logger.warning("exercise_draft failure topic_id={} kind={} attempt={} latency_ms={:.0f} error={}",
+                               topic_id, body.kind.value, attempt, (time.perf_counter() - started) * 1000, type(exc).__name__)
+                if attempt < MAX_DRAFT_ATTEMPTS:
+                    last_issues = [str(exc)]
+                    continue
+                raise UpstreamServiceException("AI could not draft this skill. Try again or write it manually.") from exc
+        # Unreachable: the loop above always returns or raises.
+        raise UpstreamServiceException("AI could not draft this skill. Try again or write it manually.")
 
 
 def get_exercise_draft_service() -> ExerciseDraftService:

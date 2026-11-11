@@ -29,12 +29,32 @@ class FakeExerciseDrafter:
         self.calls: list[ExerciseKind] = []
         self.last_usage = None
 
+    # Deliberately distinct per kind (not just a different kind-name word
+    # with otherwise-identical content) - a real drafted batch must not
+    # produce near-duplicate exercises across different skills, and
+    # Slice 4's quality gate now checks for exactly that.
+    _BY_KIND = {
+        "multiple_choice": ("Which activity is part of Maya's typical morning routine?",
+                             "Maya describes her typical morning routine in the passage.",
+                             ["Making coffee", "Going to the gym"]),
+        "reading": ("What time does Maya usually start her typical morning routine?",
+                    "Maya wakes up early and reviews her schedule before heading out.",
+                    ["Early in the morning", "Late at night"]),
+        "grammar": ("Which verb tense does Maya use to describe her typical morning routine?",
+                    "Maya's routine is described using the present simple tense.",
+                    ["Present simple", "Past continuous"]),
+    }
+
     async def draft(self, *, title, level, source, kind, count, focus, content):
         self.calls.append(kind)
         if self.error is not None:
             raise self.error
-        return [LessonExerciseIn(kind=kind, prompt=f"Question for {kind.value}", content="Some content.",
-                                 options=["A", "B"], correct_option=0)]
+        prompt, body, options = self._BY_KIND.get(
+            kind.value, (f"What does Maya's typical morning routine show about her {kind.value} skills?",
+                         "Maya describes her typical morning routine in detail.",
+                         ["Her morning routine", "Nothing relevant"]),
+        )
+        return [LessonExerciseIn(kind=kind, prompt=prompt, content=body, options=options, correct_option=0)]
 
 
 def _override_lesson_draft_service(content_drafter=None, exercise_drafter=None):

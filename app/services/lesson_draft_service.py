@@ -41,6 +41,7 @@ from app.core.exercise_drafting import (
     ExerciseDraftingNotConfigured,
     get_exercise_drafter,
 )
+from app.core.exercise_quality import existing_exercises_for_duplicate_check, validate_exercise_suggestion
 from app.models.ai_generation import AIGenerationType
 from app.models.topic_content import (
     ExerciseKind,
@@ -70,6 +71,12 @@ DEFAULT_DRAFT_EXERCISE_KINDS: list[ExerciseKind] = [
     ExerciseKind.READING,
     ExerciseKind.GRAMMAR,
 ]
+
+# One bounded retry when a drafted exercise fails the quality gate - never
+# unbounded, and the retry is itself a normal cost-tracked/budget-checked
+# generation, not a free extra call. Same constant/reasoning as
+# `exercise_draft_service.MAX_DRAFT_ATTEMPTS`.
+MAX_EXERCISE_DRAFT_ATTEMPTS = 2
 
 
 def _content_already_filled(topic: TopicContent) -> bool:
@@ -191,7 +198,8 @@ class LessonDraftService:
         })
 
     async def _draft_one_exercise(
-        self, topic_id: str, kind: ExerciseKind, requested_by_id: Optional[str]
+        self, topic_id: str, kind: ExerciseKind, requested_by_id: Optional[str],
+        exclude_draft_index: Optional[int] = None,
     ) -> LessonDraftExerciseSuggestion:
         """Mirrors `ExerciseDraftService.draft`'s own cost-control wiring
         exactly (same claim/complete/fail calls, same source bound) - kept
@@ -206,39 +214,75 @@ class LessonDraftService:
         if topic.learning_objectives and not topic.objectives_approved:
             raise UnprocessableException("Review and approve learning objectives before generating lesson content")
         source = topic.approved_transcript.strip()[: get_settings().MAX_DRAFTING_SOURCE_CHARS]
+        objective_texts = [o.text for o in topic.learning_objectives]
+        # A regenerate replaces exactly one pending suggestion - it must not
+        # be treated as a duplicate of the very thing it's about to replace.
+        topic_for_siblings = topic
+        if exclude_draft_index is not None:
+            topic_for_siblings = topic.model_copy(update={
+                "draft_exercises": [item for i, item in enumerate(topic.draft_exercises) if i != exclude_draft_index],
+            })
+        siblings = existing_exercises_for_duplicate_check(topic_for_siblings)
 
-        generation_key = compute_generation_key(
-            AIGenerationType.EXERCISE_DRAFT,
-            topic_id=topic_id,
-            kind=kind.value,
-            count=1,
-            focus="",
-            content="",
-            source=source,
-            model=EXERCISE_DRAFTING_MODEL,
-        )
-        claim = await claim_generation(
-            generation_type=AIGenerationType.EXERCISE_DRAFT,
-            generation_key=generation_key,
-            model=EXERCISE_DRAFTING_MODEL,
-            topic_id=topic_id,
-            requested_by_id=requested_by_id,
-        )
-        try:
-            exercises = await self.exercise_drafter.draft(
-                title=topic.title, level=topic.level, source=source, kind=kind, count=1, focus="", content="",
+        last_issues: list[str] = []
+        for attempt in range(1, MAX_EXERCISE_DRAFT_ATTEMPTS + 1):
+            generation_key = compute_generation_key(
+                AIGenerationType.EXERCISE_DRAFT,
+                topic_id=topic_id,
+                kind=kind.value,
+                count=1,
+                focus="",
+                content="",
+                source=source,
+                model=EXERCISE_DRAFTING_MODEL,
+                **({"attempt": attempt} if attempt > 1 else {}),
             )
-            if len(exercises) != 1 or exercises[0].kind != kind:
-                raise ExerciseDraftingError("Provider returned the wrong exercise type or count")
-        except (ExerciseDraftingError, ExerciseDraftingNotConfigured) as exc:
-            await fail_generation(claim, exc)
-            raise
-        usage = getattr(self.exercise_drafter, "last_usage", None)
-        await complete_generation(
-            claim, input_tokens=getattr(usage, "input_tokens", None), output_tokens=getattr(usage, "output_tokens", None)
-        )
-        exercise = exercises[0].model_dump()
-        return LessonDraftExerciseSuggestion(kind=kind, exercise=exercise, state=LessonDraftStepState.DONE)
+            claim = await claim_generation(
+                generation_type=AIGenerationType.EXERCISE_DRAFT,
+                generation_key=generation_key,
+                model=EXERCISE_DRAFTING_MODEL,
+                topic_id=topic_id,
+                requested_by_id=requested_by_id,
+            )
+            retry_focus = "" if attempt == 1 else (
+                f"Previous attempt was rejected for: {'; '.join(last_issues)}. "
+                "Write a clearly different, better-grounded question this time."
+            )
+            try:
+                exercises = await self.exercise_drafter.draft(
+                    title=topic.title, level=topic.level, source=source, kind=kind, count=1,
+                    focus=retry_focus, content="",
+                )
+                if len(exercises) != 1 or exercises[0].kind != kind:
+                    raise ExerciseDraftingError("Provider returned the wrong exercise type or count")
+                issues = validate_exercise_suggestion(
+                    exercises[0], source=source, objectives=objective_texts, level=topic.level, siblings=siblings,
+                )
+                if issues:
+                    reasons = [f"{i.code}: {i.message}" for i in issues]
+                    await fail_generation(claim, ExerciseDraftingError("; ".join(reasons)))
+                    last_issues = reasons
+                    if attempt < MAX_EXERCISE_DRAFT_ATTEMPTS:
+                        continue
+                    raise ExerciseDraftingError("; ".join(reasons))
+            except ExerciseDraftingNotConfigured as exc:
+                await fail_generation(claim, exc)
+                raise
+            except ExerciseDraftingError as exc:
+                await fail_generation(claim, exc)
+                if attempt < MAX_EXERCISE_DRAFT_ATTEMPTS:
+                    last_issues = [str(exc)]
+                    continue
+                raise
+            else:
+                usage = getattr(self.exercise_drafter, "last_usage", None)
+                await complete_generation(
+                    claim, input_tokens=getattr(usage, "input_tokens", None), output_tokens=getattr(usage, "output_tokens", None)
+                )
+                exercise = exercises[0].model_dump()
+                return LessonDraftExerciseSuggestion(kind=kind, exercise=exercise, state=LessonDraftStepState.DONE)
+        # Unreachable: the loop above always returns or raises.
+        raise ExerciseDraftingError("Exercise drafting exhausted its retry budget")
 
     async def _append_draft_exercise(self, topic_id: str, suggestion: LessonDraftExerciseSuggestion) -> None:
         current = await self.topic_repository.get_by_id(topic_id)
@@ -298,7 +342,7 @@ class LessonDraftService:
         if index < 0 or index >= len(topic.draft_exercises):
             raise NotFoundException("No such lesson draft suggestion")
         kind = topic.draft_exercises[index].kind
-        fresh = await self._draft_one_exercise(topic_id, kind, teacher.id)
+        fresh = await self._draft_one_exercise(topic_id, kind, teacher.id, exclude_draft_index=index)
         current = await self.topic_repository.get_by_id(topic_id)
         drafts = [item.model_dump() for item in current.draft_exercises]
         drafts[index] = fresh.model_dump()
