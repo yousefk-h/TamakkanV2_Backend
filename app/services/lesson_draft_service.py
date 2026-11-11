@@ -108,6 +108,8 @@ class LessonDraftService:
 
     async def start(self, topic_id: str, teacher: User) -> TopicContent:
         topic = await self.topics.get_own_topic(topic_id, teacher)
+        if topic.learning_objectives and not topic.objectives_approved:
+            raise UnprocessableException("Review and approve learning objectives before generating lesson content")
         if not topic.approved_transcript or len(topic.approved_transcript.strip()) < MIN_SOURCE_CHARS_FOR_DRAFTING:
             raise UnprocessableException(NOT_ENOUGH_SOURCE_MESSAGE)
         if topic.lesson_draft_job is not None and topic.lesson_draft_job.state == LessonDraftStepState.RUNNING:
@@ -201,6 +203,8 @@ class LessonDraftService:
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None or not topic.approved_transcript:
             raise NotFoundException("Topic not found")
+        if topic.learning_objectives and not topic.objectives_approved:
+            raise UnprocessableException("Review and approve learning objectives before generating lesson content")
         source = topic.approved_transcript.strip()[: get_settings().MAX_DRAFTING_SOURCE_CHARS]
 
         generation_key = compute_generation_key(

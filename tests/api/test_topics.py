@@ -17,6 +17,7 @@ from app.repositories.topic_content_repository import TopicContentRepository
 from app.services.progress_service import get_progress_service
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
 from app.services.exercise_draft_service import ExerciseDraftService, get_exercise_draft_service
+from app.services.objective_draft_service import ObjectiveDraftService, get_objective_draft_service
 from app.schema.topic import LessonExerciseIn, TopicListItem
 from app.services.transcript_pipeline_service import (
     TranscriptPipelineService,
@@ -205,6 +206,78 @@ async def test_ai_exercise_draft_is_grounded_teacher_scoped_and_not_saved(client
     assert response.status_code == 200
     assert response.json()["exercises"][0]["prompt"] == "When does Maya leave?"
     assert client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()["lesson_exercises"] == []
+
+
+async def test_learning_objectives_are_ordered_reviewed_and_gate_ai_drafting(client):
+    """Objectives are teacher-only state: edits invalidate approval, while
+    existing lesson work stays intact and dependent drafting is blocked."""
+    token = await _login(client, Role.TEACHER, "objectives-teacher@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    created = client.post("/api/v1/topics", json={
+        "title": "Directions", "level": "beginner",
+        "lesson_exercises": [{"kind": "reflection", "prompt": "Describe your route."}],
+    }, headers=headers).json()
+    topic_id = created["id"]
+    saved = client.put(f"/api/v1/topics/{topic_id}/objectives", json={"objectives": [
+        {"text": "Ask for directions to a place.", "source": "manual"},
+        {"text": "Give simple directions using left and right.", "source": "ai"},
+    ]}, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert [item["text"] for item in saved.json()["learning_objectives"]] == [
+        "Ask for directions to a place.", "Give simple directions using left and right.",
+    ]
+    assert saved.json()["objectives_approved"] is False
+    approved = client.post(f"/api/v1/topics/{topic_id}/objectives/approve", headers=headers)
+    assert approved.status_code == 200
+    assert approved.json()["objectives_approved"] is True
+    # A re-order is a real curriculum change, so approval is explicitly lost;
+    # the authored exercise survives untouched.
+    reordered = client.put(f"/api/v1/topics/{topic_id}/objectives", json={"objectives": saved.json()["learning_objectives"][::-1]}, headers=headers)
+    assert reordered.status_code == 200
+    assert reordered.json()["objectives_approved"] is False
+    assert reordered.json()["lesson_exercises"][0]["kind"] == "reflection"
+    stored = await TopicContent.get(topic_id)
+    stored.approved_transcript = "The museum is next to the bank. Turn left at the park. " * 3
+    await stored.save()
+    blocked = client.post(f"/api/v1/topics/{topic_id}/draft-exercises", json={"kind": "reading", "count": 1}, headers=headers)
+    assert blocked.status_code == 422
+    assert "objectives" in blocked.text.lower()
+
+
+async def test_objective_suggestions_are_transient_and_cost_controlled(client):
+    class FakeObjectiveDrafter:
+        last_usage = None
+
+        async def draft(self, **kwargs):
+            assert "bank" in kwargs["source"]
+            return ["Ask for directions to the bank.", "Give directions using left and right."]
+
+    teacher = await _login(client, Role.TEACHER, "objective-ai@example.com")
+    other = await _login(client, Role.TEACHER, "objective-other@example.com")
+    headers = {"Authorization": f"Bearer {teacher}"}
+    topic = client.post("/api/v1/topics", json={"title": "Directions", "level": "beginner"}, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.approved_transcript = "The bank is beside the museum. Turn right after the park. " * 3
+    await stored.save()
+    app.dependency_overrides[get_objective_draft_service] = lambda: ObjectiveDraftService(
+        get_topic_content_service(), FakeObjectiveDrafter()
+    )
+    try:
+        assert client.post(f"/api/v1/topics/{topic['id']}/suggest-objectives", headers={"Authorization": f"Bearer {other}"}).status_code == 403
+        response = client.post(f"/api/v1/topics/{topic['id']}/suggest-objectives", headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_objective_draft_service, None)
+    assert response.status_code == 200, response.text
+    assert response.json() == [{"text": "Ask for directions to the bank."}, {"text": "Give directions using left and right."}]
+    fetched = client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()
+    assert fetched["learning_objectives"] == []
+    assert len(fetched["objective_drafts"]) == 2
+    accepted = client.post(f"/api/v1/topics/{topic['id']}/objective-drafts/0/accept", headers=headers)
+    assert accepted.status_code == 200
+    assert accepted.json()["learning_objectives"][0]["source"] == "ai"
+    rejected = client.post(f"/api/v1/topics/{topic['id']}/objective-drafts/0/reject", headers=headers)
+    assert rejected.status_code == 200
+    assert rejected.json()["objective_drafts"] == []
 
 
 async def test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request(client):

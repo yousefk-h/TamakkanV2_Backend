@@ -41,6 +41,8 @@ class ExerciseDraftService:
 
     async def draft(self, topic_id: str, teacher: User, body: DraftExercisesRequest) -> DraftExercisesResponse:
         topic = await self.topics.get_own_topic(topic_id, teacher)
+        if topic.learning_objectives and not topic.objectives_approved:
+            raise UnprocessableException("Review and approve learning objectives before generating lesson content")
         if body.kind not in GENERATABLE_KINDS:
             raise UnprocessableException("This skill uses teacher media or the existing vocabulary drafting flow")
         source = (topic.approved_transcript or "").strip()

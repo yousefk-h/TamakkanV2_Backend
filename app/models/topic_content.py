@@ -189,8 +189,8 @@ class ObjectiveSource(str, Enum):
 
 class LearningObjective(BaseModel):
     """What the STUDENT should be able to say or do by the end - written by
-    the teacher, or AI-suggested and then explicitly accepted. Never shown to
-    a student until `TopicContent.objectives_approved` is set."""
+    the teacher, or AI-suggested and then explicitly accepted. It is
+    teacher-only curriculum metadata; student delivery never exposes it."""
 
     text: str
     source: ObjectiveSource = ObjectiveSource.MANUAL
@@ -299,6 +299,11 @@ class TopicContent(BaseDocument):
     # presents both uniformly to the pipeline and the API.
     source_documents: list[SourceDocument] = Field(default_factory=list)
     learning_objectives: list[LearningObjective] = Field(default_factory=list)
+    # Transient teacher-only AI proposals. Keeping them on the Topic lets a
+    # refresh return the same reviewed drafts instead of paying for the same
+    # request again. They never become objectives without an explicit save.
+    objective_drafts: list[LearningObjective] = Field(default_factory=list)
+    objective_draft_generation_key: Optional[str] = None
     # Explicit teacher approval gate: AI drafting that depends on objectives
     # refuses to run while objectives exist but are not yet approved.
     objectives_approved: bool = False

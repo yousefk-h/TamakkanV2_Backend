@@ -35,6 +35,8 @@ from app.models.topic_content import (
     LessonExercise,
     LessonDraftExerciseSuggestion,
     LessonDraftJob,
+    LearningObjective,
+    ObjectiveSource,
     PracticeScheduleBlock,
     SentenceStarterBlock,
     SourceDocument,
@@ -232,6 +234,33 @@ class TopicUpdate(BaseModel):
     arabic_intervention_level: Optional[ArabicInterventionLevel] = None
 
 
+class LearningObjectiveIn(BaseModel):
+    """A teacher-reviewed outcome.  This is deliberately separate from the
+    generic topic PATCH so changing objectives always goes through the
+    explicit approval-invalidating workflow."""
+
+    text: Annotated[str, Field(min_length=1, max_length=400)]
+    source: ObjectiveSource = ObjectiveSource.MANUAL
+
+    @model_validator(mode="after")
+    def non_blank_text(self) -> "LearningObjectiveIn":
+        self.text = self.text.strip()
+        if not self.text:
+            raise ValueError("Learning objective cannot be blank")
+        return self
+
+
+class LearningObjectivesUpdate(BaseModel):
+    objectives: Annotated[list[LearningObjectiveIn], Field(max_length=8)]
+
+
+class ObjectiveSuggestionPublic(BaseModel):
+    """A transient AI suggestion.  Provider/model/usage metadata never
+    crosses this boundary; accepting it is a separate teacher action."""
+
+    text: str
+
+
 class ApproveTranscriptRequest(BaseModel):
     """Optional body for `POST /topics/{id}/approve-transcript`. Omitted or
     null keeps the existing behavior (auto-join `raw_transcript`'s segments);
@@ -414,6 +443,11 @@ class TopicPublic(BaseSchema):
     # Additional uploaded/pasted authoring sources.  Never included in a
     # Student response because their extracted text is not reviewed content.
     source_documents: Optional[list[SourceDocument]] = None
+    # Authoring-only. Students never receive objectives (approved or not),
+    # avoiding disclosure of AI/teacher curriculum metadata.
+    learning_objectives: list[LearningObjective] = Field(default_factory=list)
+    objectives_approved: bool = False
+    objective_drafts: list[LearningObjective] = Field(default_factory=list)
     # AI-suggested exercises awaiting teacher review (Slice C) - same
     # disclosure rule as avatar_prompt/raw_transcript: a draft is authoring
     # material, never shown to a student. See LessonDraftExerciseSuggestion.
@@ -447,6 +481,9 @@ class TopicPublic(BaseSchema):
                 "pdf_filename": topic.pdf_filename,
                 "pdf_extracted_text": topic.pdf_extracted_text,
                 "source_documents": topic.source_documents,
+                "learning_objectives": topic.learning_objectives,
+                "objectives_approved": topic.objectives_approved,
+                "objective_drafts": topic.objective_drafts,
                 "draft_exercises": topic.draft_exercises,
                 "lesson_draft_job": topic.lesson_draft_job,
             }

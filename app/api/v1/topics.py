@@ -36,6 +36,8 @@ from app.schema.topic import (
     TopicListItem,
     TopicPublic,
     TopicUpdate,
+    LearningObjectivesUpdate,
+    ObjectiveSuggestionPublic,
     TextSourceCreate,
     resolve_thumbnail_url,
 )
@@ -59,6 +61,7 @@ from app.services.transcript_review_service import (
 from app.services.enrollment_service import EnrollmentService, get_enrollment_service
 from app.services.exercise_draft_service import DraftExercisesRequest, DraftExercisesResponse, ExerciseDraftService, get_exercise_draft_service
 from app.services.lesson_draft_service import LessonDraftService, get_lesson_draft_service
+from app.services.objective_draft_service import ObjectiveDraftService, get_objective_draft_service
 
 router = APIRouter()
 
@@ -206,6 +209,61 @@ async def update_topic(
     """
     topic = await service.update(topic_id, body, admin)
     return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.put("/topics/{topic_id}/objectives", response_model=TopicPublic)
+async def update_learning_objectives(
+    topic_id: str,
+    body: LearningObjectivesUpdate,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    """Replace the teacher's objective list and reset approval only when it
+    actually changed. Existing lesson blocks are intentionally untouched."""
+    topic = await service.update_learning_objectives(topic_id, body, teacher)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/objectives/approve", response_model=TopicPublic)
+async def approve_learning_objectives(
+    topic_id: str,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    topic = await service.approve_learning_objectives(topic_id, teacher)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/suggest-objectives", response_model=list[ObjectiveSuggestionPublic])
+async def suggest_learning_objectives(
+    topic_id: str,
+    refresh: bool = Query(False, description="Explicitly replace existing pending suggestions."),
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: ObjectiveDraftService = Depends(get_objective_draft_service),
+) -> list[ObjectiveSuggestionPublic]:
+    """Transient, teacher-only AI suggestions. They are never persisted or
+    delivered to students until the teacher explicitly saves and approves."""
+    return [ObjectiveSuggestionPublic(text=item.text) for item in await service.draft(topic_id, teacher, refresh)]
+
+
+@router.post("/topics/{topic_id}/objective-drafts/{index}/accept", response_model=TopicPublic)
+async def accept_objective_suggestion(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    return TopicPublic.from_topic(await service.accept_objective_draft(topic_id, index, teacher), include_internal=True)
+
+
+@router.post("/topics/{topic_id}/objective-drafts/{index}/reject", response_model=TopicPublic)
+async def reject_objective_suggestion(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    return TopicPublic.from_topic(await service.reject_objective_draft(topic_id, index, teacher), include_internal=True)
 
 
 @router.post("/topics/{topic_id}/draft-exercises", response_model=DraftExercisesResponse)

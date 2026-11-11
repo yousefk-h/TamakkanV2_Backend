@@ -275,6 +275,8 @@ class TranscriptPipelineService:
         return await self._get_or_404(topic_id)
 
     def _require_draftable_source(self, topic: TopicContent) -> None:
+        if topic.learning_objectives and not topic.objectives_approved:
+            raise UnprocessableException("Review and approve learning objectives before generating lesson content")
         if not topic.approved_transcript:
             raise UnprocessableException("Approve this topic's transcript before drafting content")
         if len(topic.approved_transcript.strip()) < MIN_SOURCE_CHARS_FOR_DRAFTING:
@@ -350,6 +352,9 @@ class TranscriptPipelineService:
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None or not topic.approved_transcript:
             return  # deleted, or approved with empty text (shouldn't happen - guarded in approve_transcript)
+        if topic.learning_objectives and not topic.objectives_approved:
+            logger.info("Skipping content draft for topic {} - objectives need teacher approval", topic_id)
+            return
         if len(topic.approved_transcript.strip()) < MIN_SOURCE_CHARS_FOR_DRAFTING:
             # Reachable only if the topic's transcript was edited down after
             # `start_content_drafting`/`start_regenerate_content` already

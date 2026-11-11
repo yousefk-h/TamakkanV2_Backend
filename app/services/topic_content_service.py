@@ -21,7 +21,7 @@ from app.core.document_extraction import DocumentExtractionError, extract_docume
 from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
 from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage, get_lesson_audio_storage
 from app.core.youtube import fetch_video_duration_seconds
-from app.models.topic_content import SourceDocument, SourceDocumentKind, TopicContent, TranscriptState
+from app.models.topic_content import LearningObjective, SourceDocument, SourceDocumentKind, TopicContent, TranscriptState
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.level_profile import LevelProfile
 from app.models.user import Role, User
@@ -29,7 +29,7 @@ from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, TopicCo
 from app.repositories.unit_repository import UnitRepository
 from app.repositories.user_repository import UserRepository
 from app.schema.challenge import LessonDayState
-from app.schema.topic import EnrolledStudent, TopicAdminDetail, TopicCreate, TopicUpdate
+from app.schema.topic import EnrolledStudent, LearningObjectivesUpdate, TopicAdminDetail, TopicCreate, TopicUpdate
 from app.services.progress_service import ProgressService, get_progress_service
 from app.utils.time import utcnow
 
@@ -332,6 +332,55 @@ class TopicContentService:
         if changes:
             changes.update(await self._start_content_revision(topic))
             await self.topic_repository.update_fields(topic_id, changes)
+        return await self.get_one(topic_id)
+
+    async def update_learning_objectives(
+        self, topic_id: str, body: LearningObjectivesUpdate, admin: User
+    ) -> TopicContent:
+        """Save only the reviewed objective list.
+
+        Any material change deliberately clears the approval flag, but does
+        not touch exercises, source, transcript or an already published
+        revision. This keeps an old published delivery stable while the
+        teacher reviews the revised curriculum intent.
+        """
+        topic = await self.get_own_topic(topic_id, admin)
+        objectives = [LearningObjective(**objective.model_dump()) for objective in body.objectives]
+        previous = [objective.model_dump() for objective in topic.learning_objectives]
+        next_values = [objective.model_dump() for objective in objectives]
+        changes: dict = {"learning_objectives": next_values}
+        if previous != next_values:
+            changes["objectives_approved"] = False
+        await self.topic_repository.update_fields(topic_id, changes)
+        return await self.get_one(topic_id)
+
+    async def approve_learning_objectives(self, topic_id: str, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if not topic.learning_objectives:
+            raise UnprocessableException("Add at least one learning objective before approving")
+        await self.topic_repository.update_fields(topic_id, {"objectives_approved": True})
+        return await self.get_one(topic_id)
+
+    async def accept_objective_draft(self, topic_id: str, index: int, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if index < 0 or index >= len(topic.objective_drafts):
+            raise NotFoundException("No such objective suggestion")
+        accepted = topic.objective_drafts[index]
+        remaining = [item.model_dump() for item_index, item in enumerate(topic.objective_drafts) if item_index != index]
+        objectives = [item.model_dump() for item in topic.learning_objectives] + [accepted.model_dump()]
+        await self.topic_repository.update_fields(topic_id, {
+            "learning_objectives": objectives,
+            "objective_drafts": remaining,
+            "objectives_approved": False,
+        })
+        return await self.get_one(topic_id)
+
+    async def reject_objective_draft(self, topic_id: str, index: int, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if index < 0 or index >= len(topic.objective_drafts):
+            raise NotFoundException("No such objective suggestion")
+        remaining = [item.model_dump() for item_index, item in enumerate(topic.objective_drafts) if item_index != index]
+        await self.topic_repository.update_fields(topic_id, {"objective_drafts": remaining})
         return await self.get_one(topic_id)
 
     async def delete(self, topic_id: str, admin: User) -> None:
