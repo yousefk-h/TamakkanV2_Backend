@@ -134,10 +134,11 @@ class TranscriptPipelineService:
 
     async def start_generation(self, topic_id: str) -> TopicContent:
         topic = await self._get_or_404(topic_id)
-        if not topic.youtube_urls and not topic.uploaded_video_url and not topic.pdf_extracted_text:
-            # Video-optional (card #16): a topic needs *some* source
-            # material - a video, a PDF, or both - never neither.
-            raise UnprocessableException("Topic has no video or PDF source to generate from")
+        if not topic.has_any_source:
+            # A topic needs at least one real source.  `all_source_documents`
+            # includes the legacy single-PDF slot as well as new PDF/DOCX/
+            # PPTX/pasted-text sources.
+            raise UnprocessableException("Add a video, document, or pasted text source before generating a transcript")
 
         if self._extraction_is_abandoned(topic):
             logger.warning(
@@ -199,11 +200,10 @@ class TranscriptPipelineService:
                 segments.append(TranscriptSegment(text=result.text, start=0.0, duration=0.0))
                 sources.append(result.source)
                 source_labels.append(f"Uploaded video — {filename}")
-            if topic.pdf_extracted_text:
-                filename = self._safe_source_name(topic.pdf_filename or "PDF document")
-                segments.append(TranscriptSegment(text=topic.pdf_extracted_text, start=0.0, duration=0.0))
+            for document in topic.all_source_documents:
+                segments.append(TranscriptSegment(text=document.extracted_text, start=0.0, duration=0.0))
                 sources.append(TranscriptSource.EXTRACTED_TEXT)
-                source_labels.append(f"PDF — {filename}")
+                source_labels.append(self._safe_source_name(document.label))
         except Exception as exc:
             # Broad on purpose - see the module docstring. There is no caller
             # left to raise to, and anything that escapes here leaves the topic

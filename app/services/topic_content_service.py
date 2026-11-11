@@ -17,10 +17,11 @@ if TYPE_CHECKING:
 from loguru import logger
 
 from app.core.exceptions import ForbiddenException, NotFoundException, UnprocessableException
+from app.core.document_extraction import DocumentExtractionError, extract_document_text
 from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
 from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage, get_lesson_audio_storage
 from app.core.youtube import fetch_video_duration_seconds
-from app.models.topic_content import TopicContent, TranscriptState
+from app.models.topic_content import SourceDocument, SourceDocumentKind, TopicContent, TranscriptState
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.level_profile import LevelProfile
 from app.models.user import Role, User
@@ -30,6 +31,7 @@ from app.repositories.user_repository import UserRepository
 from app.schema.challenge import LessonDayState
 from app.schema.topic import EnrolledStudent, TopicAdminDetail, TopicCreate, TopicUpdate
 from app.services.progress_service import ProgressService, get_progress_service
+from app.utils.time import utcnow
 
 # Generous headroom over any real lesson-cover photo - this is a thumbnail,
 # never a source asset, so there is no reason for it to approach the size of
@@ -41,6 +43,9 @@ CLOUDINARY_THUMBNAIL_FOLDER = "Tamakkan/topic-thumbnails"
 # either - generous headroom over any real lesson document.
 MAX_PDF_UPLOAD_BYTES = 20 * 1024 * 1024
 CLOUDINARY_PDF_FOLDER = "Tamakkan/topic-pdfs"
+MAX_SOURCE_DOCUMENT_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_SOURCE_DOCUMENTS = 12
+CLOUDINARY_SOURCE_DOCUMENT_FOLDER = "Tamakkan/topic-source-documents"
 MAX_SOURCE_VIDEO_UPLOAD_BYTES = 80 * 1024 * 1024
 CLOUDINARY_SOURCE_VIDEO_FOLDER = "Tamakkan/topic-videos"
 
@@ -89,14 +94,17 @@ class TopicContentService:
             "revision_snapshots": snapshots,
         }
 
-    async def _student_delivery_topic(self, topic: TopicContent, student: User) -> TopicContent:
+    async def _student_delivery_topic(
+        self, topic: TopicContent, student: User, enrollment_context: Optional["EnrollmentContext"] = None
+    ) -> TopicContent:
         """Return the revision explicitly published for this student's
         Program. Legacy/custom calendars fall back to the current revision.
         """
-        if not student.program_id:
+        program_id = enrollment_context.program_id if enrollment_context is not None else student.program_id
+        if not program_id:
             return topic
         placement = await ProgramTopic.find_one({
-            "program_id": student.program_id,
+            "program_id": program_id,
             "topic_id": topic.id,
             "status": ProgramTopicStatus.PUBLISHED.value,
             "is_deleted": False,
@@ -234,7 +242,7 @@ class TopicContentService:
             minutes = await self.progress_service.get_topic_session_minutes_for_context(requester, topic_id, enrollment_context)
         else:
             minutes = await self.progress_service.get_topic_session_minutes(requester, topic_id)
-        return await self._student_delivery_topic(topic, requester), status, minutes
+        return await self._student_delivery_topic(topic, requester, enrollment_context), status, minutes
 
     async def get_own_topic(self, topic_id: str, admin: User) -> TopicContent:
         """The Teacher write-path ownership gate (teacher isolation): a
@@ -404,6 +412,90 @@ class TopicContentService:
         )
         if previous_public_id:
             await self._delete_pdf_asset(previous_public_id)
+        return await self.get_one(topic_id)
+
+    @staticmethod
+    def _safe_source_filename(filename: str) -> str:
+        return (filename or "lesson-source").replace("\\", "/").rsplit("/", 1)[-1][:200] or "lesson-source"
+
+    @staticmethod
+    def _reset_transcript_fields() -> dict:
+        return {
+            "transcript_state": TranscriptState.QUEUED,
+            "transcript_state_started_at": None,
+            "raw_transcript": [],
+            "transcript_source_labels": [],
+            "transcript_source": None,
+            "approved_transcript": None,
+        }
+
+    async def upload_document(self, topic_id: str, file_bytes: bytes, content_type: str, filename: str, admin: User) -> TopicContent:
+        """Persist one additional document source.  Extraction happens before
+        storage, so unreadable Office files never become orphaned assets."""
+        if not file_bytes or len(file_bytes) > MAX_SOURCE_DOCUMENT_UPLOAD_BYTES:
+            raise UnprocessableException("Document is empty or larger than 20 MB")
+        topic = await self.get_own_topic(topic_id, admin)
+        if len(topic.source_documents) >= MAX_SOURCE_DOCUMENTS:
+            raise UnprocessableException(f"A lesson can have up to {MAX_SOURCE_DOCUMENTS} additional sources")
+        try:
+            kind, extracted_text = extract_document_text(file_bytes, content_type, filename)
+        except DocumentExtractionError as exc:
+            raise UnprocessableException(str(exc)) from exc
+
+        # A transcript review must remain bounded even when several valid files
+        # are combined.  The pipeline consumes every stored source verbatim.
+        if sum(len(item.extracted_text) for item in topic.all_source_documents) + len(extracted_text) > 1_000_000:
+            raise UnprocessableException("Combined source text is too large for one lesson")
+        safe_filename = self._safe_source_filename(filename)
+        public_id = f"{CLOUDINARY_SOURCE_DOCUMENT_FOLDER}/{topic_id}-{uuid.uuid4().hex}"
+        try:
+            result = await self.document_storage.upload(file_bytes, public_id)
+        except UploadFailedError as exc:
+            logger.warning("Document upload failed for topic {}: {}", topic_id, exc)
+            raise UnprocessableException("Could not upload this document. Please try again.") from exc
+        document = SourceDocument(
+            kind=SourceDocumentKind(kind), label=f"{kind.upper()} — {safe_filename}", filename=safe_filename,
+            url=result.secure_url, public_id=result.public_id, extracted_text=extracted_text, added_at=utcnow(),
+        )
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "source_documents": [*topic.source_documents, document],
+            **self._reset_transcript_fields(), **revision,
+        })
+        return await self.get_one(topic_id)
+
+    async def add_text_source(self, topic_id: str, label: str, text: str, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        cleaned = text.strip()
+        if not cleaned:
+            raise UnprocessableException("Paste some source text before adding it")
+        if len(topic.source_documents) >= MAX_SOURCE_DOCUMENTS:
+            raise UnprocessableException(f"A lesson can have up to {MAX_SOURCE_DOCUMENTS} additional sources")
+        if sum(len(item.extracted_text) for item in topic.all_source_documents) + len(cleaned) > 1_000_000:
+            raise UnprocessableException("Combined source text is too large for one lesson")
+        document = SourceDocument(
+            kind=SourceDocumentKind.TEXT, label=(label.strip() or "Pasted text")[:200],
+            extracted_text=cleaned, added_at=utcnow(),
+        )
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "source_documents": [*topic.source_documents, document],
+            **self._reset_transcript_fields(), **revision,
+        })
+        return await self.get_one(topic_id)
+
+    async def remove_source_document(self, topic_id: str, index: int, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if index < 0 or index >= len(topic.source_documents):
+            raise NotFoundException("Source document not found")
+        removed = topic.source_documents[index]
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "source_documents": [*topic.source_documents[:index], *topic.source_documents[index + 1:]],
+            **self._reset_transcript_fields(), **revision,
+        })
+        if removed.public_id:
+            await self._delete_pdf_asset(removed.public_id)
         return await self.get_one(topic_id)
 
     async def upload_source_video(self, topic_id: str, file_bytes: bytes, content_type: str, filename: str, admin: User) -> TopicContent:

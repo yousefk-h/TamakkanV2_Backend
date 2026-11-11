@@ -42,6 +42,7 @@ class AIGenerationType(str, Enum):
     CONTENT_REGENERATE = "content_regenerate"
     VOCABULARY_ARABIC_BACKFILL = "vocabulary_arabic_backfill"
     EXERCISE_DRAFT = "exercise_draft"
+    OBJECTIVES_DRAFT = "objectives_draft"
     TRANSCRIPT_ENGLISH_REVIEW = "transcript_english_review"
     SESSION_SCORING = "session_scoring"
 

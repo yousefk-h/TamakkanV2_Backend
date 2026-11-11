@@ -157,6 +157,55 @@ class TopicRevisionSnapshot(BaseModel):
     content: dict[str, Any]
 
 
+class SourceDocumentKind(str, Enum):
+    PDF = "pdf"
+    DOCX = "docx"
+    PPTX = "pptx"
+    TEXT = "text"
+
+
+class SourceDocument(BaseModel):
+    """One teacher-supplied non-video lesson source (Phase 1 of the Lesson
+    Builder transformation): an uploaded PDF/Word/PowerPoint document whose
+    text was extracted at upload time, or text the teacher pasted directly.
+    Each becomes its own labelled `raw_transcript` segment in
+    `TranscriptPipelineService.run_generation`, so the existing review /
+    approve / draft pipeline needs no new state. `url`/`public_id` are `None`
+    for pasted text (nothing is stored in Cloudinary for it)."""
+
+    kind: SourceDocumentKind
+    label: str
+    filename: Optional[str] = None
+    url: Optional[str] = None
+    public_id: Optional[str] = None
+    extracted_text: str
+    added_at: datetime
+
+
+class ObjectiveSource(str, Enum):
+    MANUAL = "manual"
+    AI = "ai"
+
+
+class LearningObjective(BaseModel):
+    """What the STUDENT should be able to say or do by the end - written by
+    the teacher, or AI-suggested and then explicitly accepted. Never shown to
+    a student until `TopicContent.objectives_approved` is set."""
+
+    text: str
+    source: ObjectiveSource = ObjectiveSource.MANUAL
+
+
+class LessonFlow(str, Enum):
+    """Owner-approved lesson flows. `interactive_video` is persisted now so a
+    teacher's choice survives; its timestamp-based checkpoint timeline is a
+    later phase (see docs/ROADMAP.md) and until then the student experience
+    is the standard sequence for both values."""
+
+    STANDARD = "standard"
+    INTERACTIVE_VIDEO = "interactive_video"
+
+
 class LessonDraftStepState(str, Enum):
     """One step's status within a `LessonDraftJob` - distinct from
     `AIGenerationStatus` (app.models.ai_generation), which tracks one
@@ -245,6 +294,16 @@ class TopicContent(BaseDocument):
     pdf_filename: Optional[str] = None
     pdf_extracted_text: Optional[str] = None
 
+    # Additional document/text sources (Phase 1). The legacy `pdf_*` slot
+    # above is left untouched for every existing topic; `all_source_documents`
+    # presents both uniformly to the pipeline and the API.
+    source_documents: list[SourceDocument] = Field(default_factory=list)
+    learning_objectives: list[LearningObjective] = Field(default_factory=list)
+    # Explicit teacher approval gate: AI drafting that depends on objectives
+    # refuses to run while objectives exist but are not yet approved.
+    objectives_approved: bool = False
+    lesson_flow: LessonFlow = LessonFlow.STANDARD
+
     # Topic organization by unit + order (card #17). `unit_id` is `None` for
     # a legacy/unassigned topic - the UI groups those under an "Unassigned"
     # bucket per level rather than hiding them. `order_index` breaks ties
@@ -329,6 +388,27 @@ class TopicContent(BaseDocument):
     # `fetch()` returns the Link itself rather than `None` for a dangling
     # target.
     created_by_id: Annotated[Optional[str], Indexed()] = None
+
+    @property
+    def all_source_documents(self) -> list[SourceDocument]:
+        """Every non-video source in display order: the legacy single PDF
+        slot first (when present), then `source_documents`."""
+        items: list[SourceDocument] = []
+        if self.pdf_extracted_text:
+            items.append(SourceDocument(
+                kind=SourceDocumentKind.PDF,
+                label=f"PDF — {self.pdf_filename or 'PDF document'}",
+                filename=self.pdf_filename,
+                url=self.pdf_url,
+                public_id=self.pdf_public_id,
+                extracted_text=self.pdf_extracted_text,
+                added_at=self.updated_at,
+            ))
+        return items + list(self.source_documents)
+
+    @property
+    def has_any_source(self) -> bool:
+        return bool(self.youtube_urls or self.uploaded_video_url or self.all_source_documents)
 
     def make_revision_snapshot(self) -> TopicRevisionSnapshot:
         return TopicRevisionSnapshot(

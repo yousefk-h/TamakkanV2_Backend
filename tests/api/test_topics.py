@@ -27,6 +27,7 @@ from app.services.transcript_review_service import (
     get_transcript_review_service,
 )
 from tests.core.test_pdf_extraction import build_minimal_pdf
+from tests.core.test_document_extraction import build_docx, build_pptx
 from tests.services.test_transcript_pipeline_service import (
     FakeContentDrafter,
     FakeTranscriber,
@@ -1607,6 +1608,62 @@ async def test_teacher_b_cannot_upload_a_pdf_to_teacher_as_topic(client):
         headers={"Authorization": f"Bearer {token_b}"},
     )
     assert resp.status_code == 403
+
+
+async def test_multiple_document_and_text_sources_reach_review_and_approval(client):
+    token = await _login(client, Role.TEACHER, "document-sources@example.com")
+    topic = client.post(
+        "/api/v1/topics", json={"title": "Work source lesson", "level": "intermediate"},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    _override_document_storage(FakeDocumentStorage())
+    headers = {"Authorization": f"Bearer {token}"}
+
+    docx = client.post(
+        f"/api/v1/topics/{topic['id']}/documents",
+        files={"file": ("notes.docx", io.BytesIO(build_docx("Meeting vocabulary")), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        headers=headers,
+    )
+    assert docx.status_code == 200
+    assert docx.json()["source_documents"][0]["kind"] == "docx"
+
+    pptx = client.post(
+        f"/api/v1/topics/{topic['id']}/documents",
+        files={"file": ("slides.pptx", io.BytesIO(build_pptx("Workplace phrases")), "application/vnd.openxmlformats-officedocument.presentationml.presentation")},
+        headers=headers,
+    )
+    assert pptx.status_code == 200
+    pasted = client.post(
+        f"/api/v1/topics/{topic['id']}/text-source", json={"label": "Teacher notes", "text": "Ask about their daily routine."}, headers=headers,
+    )
+    assert pasted.status_code == 200
+    assert len(pasted.json()["source_documents"]) == 3
+
+    generated = client.post(f"/api/v1/topics/{topic['id']}/generate-transcript", headers=headers)
+    assert generated.status_code == 202
+    final = client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()
+    assert final["transcript_state"] == "pending_review"
+    assert {segment["text"] for segment in final["raw_transcript"]} == {
+        "Meeting vocabulary", "Slide 1\nWorkplace phrases", "Ask about their daily routine.",
+    }
+    approved = client.post(f"/api/v1/topics/{topic['id']}/approve-transcript", headers=headers)
+    assert approved.status_code == 200
+    assert "Teacher notes" in approved.json()["approved_transcript"]
+
+
+async def test_document_upload_rejects_unsupported_or_malformed_files(client):
+    token = await _login(client, Role.TEACHER, "bad-document@example.com")
+    topic = await _create_topic(client, token)
+    _override_document_storage(FakeDocumentStorage())
+    headers = {"Authorization": f"Bearer {token}"}
+    unsupported = client.post(
+        f"/api/v1/topics/{topic['id']}/documents", files={"file": ("notes.txt", io.BytesIO(b"hello"), "text/plain")}, headers=headers,
+    )
+    assert unsupported.status_code == 422
+    malformed = client.post(
+        f"/api/v1/topics/{topic['id']}/documents", files={"file": ("notes.docx", io.BytesIO(b"not a docx"), "application/octet-stream")}, headers=headers,
+    )
+    assert malformed.status_code == 422
 
 
 async def test_a_non_administrator_cannot_manage_thumbnails(client):

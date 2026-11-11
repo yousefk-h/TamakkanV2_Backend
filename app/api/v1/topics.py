@@ -36,11 +36,13 @@ from app.schema.topic import (
     TopicListItem,
     TopicPublic,
     TopicUpdate,
+    TextSourceCreate,
     resolve_thumbnail_url,
 )
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.services.topic_content_service import (
     MAX_PDF_UPLOAD_BYTES,
+    MAX_SOURCE_DOCUMENT_UPLOAD_BYTES,
     MAX_SOURCE_VIDEO_UPLOAD_BYTES,
     MAX_THUMBNAIL_UPLOAD_BYTES,
     TopicContentService,
@@ -350,6 +352,44 @@ async def upload_topic_pdf(
     topic = await service.upload_pdf(
         topic_id, file_bytes, file.content_type or "application/octet-stream", file.filename or "lesson.pdf", admin
     )
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/documents", response_model=TopicPublic)
+async def upload_topic_document(
+    topic_id: str,
+    file: UploadFile = File(..., description=f"A PDF, DOCX, or PPTX lesson source, max {MAX_SOURCE_DOCUMENT_UPLOAD_BYTES // (1024 * 1024)}MB."),
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    """Adds (rather than replaces) a document source.  Extraction is
+    synchronous and validation failures are teacher-safe 422 messages."""
+    file_bytes = await file.read(MAX_SOURCE_DOCUMENT_UPLOAD_BYTES + 1)
+    topic = await service.upload_document(
+        topic_id, file_bytes, file.content_type or "application/octet-stream", file.filename or "lesson-source", admin
+    )
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/text-source", response_model=TopicPublic)
+async def add_topic_text_source(
+    topic_id: str,
+    body: TextSourceCreate,
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    topic = await service.add_text_source(topic_id, body.label, body.text, admin)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.delete("/topics/{topic_id}/documents/{index}", response_model=TopicPublic)
+async def remove_topic_document(
+    topic_id: str,
+    index: int,
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    topic = await service.remove_source_document(topic_id, index, admin)
     return TopicPublic.from_topic(topic, include_internal=True)
 
 

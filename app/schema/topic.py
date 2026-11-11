@@ -37,6 +37,7 @@ from app.models.topic_content import (
     LessonDraftJob,
     PracticeScheduleBlock,
     SentenceStarterBlock,
+    SourceDocument,
     TopicContent,
     TranscriptSegment,
     TranscriptSource,
@@ -242,6 +243,20 @@ class ApproveTranscriptRequest(BaseModel):
     approved_transcript: Optional[Transcript] = None
 
 
+class TextSourceCreate(BaseModel):
+    """Teacher-pasted lesson source.  It follows the exact same extraction
+    review path as uploaded documents, but has no external asset."""
+
+    label: Annotated[str, Field(max_length=200)] = "Pasted text"
+    text: Annotated[str, Field(min_length=1, max_length=MAX_TRANSCRIPT_LENGTH)]
+
+    @model_validator(mode="after")
+    def non_blank_text(self) -> "TextSourceCreate":
+        if not self.text.strip():
+            raise ValueError("Pasted source text cannot be blank")
+        return self
+
+
 class ReviewTranscriptEnglishRequest(BaseModel):
     """Body for `POST /topics/{id}/review-transcript-english`. The admin's
     current edit-box text, sent explicitly rather than defaulted server-side
@@ -396,6 +411,9 @@ class TopicPublic(BaseSchema):
     pdf_url: Optional[str] = None
     pdf_filename: Optional[str] = None
     pdf_extracted_text: Optional[str] = None
+    # Additional uploaded/pasted authoring sources.  Never included in a
+    # Student response because their extracted text is not reviewed content.
+    source_documents: Optional[list[SourceDocument]] = None
     # AI-suggested exercises awaiting teacher review (Slice C) - same
     # disclosure rule as avatar_prompt/raw_transcript: a draft is authoring
     # material, never shown to a student. See LessonDraftExerciseSuggestion.
@@ -428,6 +446,7 @@ class TopicPublic(BaseSchema):
                 "pdf_url": topic.pdf_url,
                 "pdf_filename": topic.pdf_filename,
                 "pdf_extracted_text": topic.pdf_extracted_text,
+                "source_documents": topic.source_documents,
                 "draft_exercises": topic.draft_exercises,
                 "lesson_draft_job": topic.lesson_draft_job,
             }
