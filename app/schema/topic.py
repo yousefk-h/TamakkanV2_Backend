@@ -683,6 +683,35 @@ class TopicPublic(BaseSchema):
         )
 
 
+class SourceVideoUploadSignature(BaseModel):
+    """Public, short-lived values needed for a browser direct upload.
+
+    Cloudinary's API key is intentionally public; the signature is scoped to
+    one server-generated public id and contains no API secret.
+    """
+
+    timestamp: int
+    signature: str
+    api_key: str
+    cloud_name: str
+    public_id: str
+
+
+class SourceVideoUploadRequest(BaseModel):
+    """Client-declared metadata checked before issuing a short-lived upload."""
+
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=120)
+    size_bytes: int = Field(gt=0, le=80 * 1024 * 1024)
+
+
+class SourceVideoFinalize(BaseModel):
+    """The browser may only finalize the exact id the server signed."""
+
+    public_id: str = Field(min_length=1, max_length=300)
+    filename: str = Field(min_length=1, max_length=255)
+
+
 class EnrolledStudent(BaseModel):
     """One row of `TopicAdminDetail.enrolled_students` - just enough to show
     in the admin Topics page, not a full user profile."""

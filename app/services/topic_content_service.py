@@ -659,6 +659,54 @@ class TopicContentService:
                 logger.warning("Could not delete replaced lesson video {}", previous)
         return await self.get_one(topic_id)
 
+    async def create_source_video_upload(
+        self, topic_id: str, content_type: str, size_bytes: int, admin: User
+    ) -> dict[str, str | int]:
+        """Authorize exactly one direct browser upload for a lesson video."""
+        allowed = {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"}
+        if content_type not in allowed:
+            raise UnprocessableException("Use an MP4, WebM, MOV or MKV lesson video")
+        if size_bytes <= 0 or size_bytes > MAX_SOURCE_VIDEO_UPLOAD_BYTES:
+            raise UnprocessableException("Video is empty or larger than 80 MB")
+        await self.get_own_topic(topic_id, admin)
+        public_id = f"{CLOUDINARY_SOURCE_VIDEO_FOLDER}/{topic_id}-{uuid.uuid4().hex}"
+        return self.video_storage.issue_direct_video_upload(public_id)
+
+    async def finalize_source_video_upload(
+        self, topic_id: str, public_id: str, filename: str, admin: User
+    ) -> TopicContent:
+        """Attach a provider-uploaded video after proving its server prefix.
+
+        The URL is derived by the server instead of trusting a browser supplied
+        URL.  A signed upload can only target the random ``public_id`` issued
+        immediately above, and this second check prevents one topic from
+        pointing at another topic's video.
+        """
+        topic = await self.get_own_topic(topic_id, admin)
+        prefix = f"{CLOUDINARY_SOURCE_VIDEO_FOLDER}/{topic_id}-"
+        if not public_id.startswith(prefix):
+            raise UnprocessableException("That upload does not belong to this lesson")
+        previous = topic.uploaded_video_public_id
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "uploaded_video_url": self.video_storage.direct_video_url(public_id),
+            "uploaded_video_public_id": public_id,
+            "uploaded_video_filename": filename,
+            "transcript_state": TranscriptState.QUEUED,
+            "transcript_state_started_at": None,
+            "raw_transcript": [],
+            "transcript_source_labels": [],
+            "transcript_source": None,
+            "approved_transcript": None,
+            **revision,
+        })
+        if previous and previous != public_id:
+            try:
+                await self.video_storage.delete(previous)
+            except UploadFailedError:
+                logger.warning("Could not delete replaced lesson video {}", previous)
+        return await self.get_one(topic_id)
+
     async def remove_source_video(self, topic_id: str, admin: User) -> TopicContent:
         topic = await self.get_own_topic(topic_id, admin)
         revision = await self._start_content_revision(topic)

@@ -1559,6 +1559,67 @@ def _override_image_storage(fake: FakeImageStorage):
     )
 
 
+class FakeDirectVideoStorage:
+    """No provider traffic: exercises the signed-upload handoff contract."""
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def issue_direct_video_upload(self, public_id: str) -> dict[str, str | int]:
+        return {
+            "timestamp": 123,
+            "signature": "test-signature",
+            "api_key": "public-key",
+            "cloud_name": "test-cloud",
+            "public_id": public_id,
+        }
+
+    def direct_video_url(self, public_id: str) -> str:
+        return f"https://video.example/{public_id}.mp4"
+
+    async def delete(self, public_id: str) -> None:
+        self.deleted.append(public_id)
+
+
+def _override_direct_video_storage(fake: FakeDirectVideoStorage):
+    app.dependency_overrides[get_topic_content_service] = lambda: TopicContentService(
+        TopicContentRepository(), get_progress_service(), video_storage=fake
+    )
+
+
+async def test_direct_source_video_signature_and_finalize_keep_topic_ownership(client):
+    token = await _login(client, Role.TEACHER, "video-owner@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={"title": "Video source", "level": "beginner"}, headers=headers).json()
+    fake = FakeDirectVideoStorage()
+    _override_direct_video_storage(fake)
+    try:
+        signature = client.post(
+            f"/api/v1/topics/{topic['id']}/source-video-signature",
+            json={"filename": "lesson.mp4", "content_type": "video/mp4", "size_bytes": 42},
+            headers=headers,
+        )
+        assert signature.status_code == 200, signature.text
+        public_id = signature.json()["public_id"]
+        assert public_id.startswith(f"Tamakkan/topic-videos/{topic['id']}-")
+        saved = client.post(
+            f"/api/v1/topics/{topic['id']}/source-video-finalize",
+            json={"public_id": public_id, "filename": "lesson.mp4"},
+            headers=headers,
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["uploaded_video_filename"] == "lesson.mp4"
+        assert saved.json()["uploaded_video_url"] == f"https://video.example/{public_id}.mp4"
+        rejected = client.post(
+            f"/api/v1/topics/{topic['id']}/source-video-finalize",
+            json={"public_id": "Tamakkan/topic-videos/some-other-topic-x", "filename": "bad.mp4"},
+            headers=headers,
+        )
+        assert rejected.status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_topic_content_service, None)
+
+
 async def test_topic_thumbnail_falls_back_to_the_derived_youtube_one(client):
     admin_token = await _login(client, Role.TEACHER, "admin@example.com")
     headers = {"Authorization": f"Bearer {admin_token}"}

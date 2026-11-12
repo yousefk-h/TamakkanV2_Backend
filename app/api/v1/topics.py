@@ -41,6 +41,9 @@ from app.schema.topic import (
     InteractiveVideoTimelineUpdate,
     InteractiveVideoTimelineSuggestionPublic,
     TextSourceCreate,
+    SourceVideoFinalize,
+    SourceVideoUploadRequest,
+    SourceVideoUploadSignature,
     resolve_thumbnail_url,
 )
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -512,6 +515,30 @@ async def upload_topic_source_video(
     topic = await service.upload_source_video(
         topic_id, file_bytes, file.content_type or "application/octet-stream", file.filename or "lesson-video.mp4", admin
     )
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/source-video-signature", response_model=SourceVideoUploadSignature)
+async def create_topic_source_video_upload(
+    topic_id: str,
+    body: SourceVideoUploadRequest,
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> SourceVideoUploadSignature:
+    """Authorize a direct-to-storage lesson-video upload without proxying it."""
+    return SourceVideoUploadSignature(**await service.create_source_video_upload(
+        topic_id, body.content_type, body.size_bytes, admin
+    ))
+
+
+@router.post("/topics/{topic_id}/source-video-finalize", response_model=TopicPublic)
+async def finalize_topic_source_video_upload(
+    topic_id: str,
+    body: SourceVideoFinalize,
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    topic = await service.finalize_source_video_upload(topic_id, body.public_id, body.filename, admin)
     return TopicPublic.from_topic(topic, include_internal=True)
 
 
