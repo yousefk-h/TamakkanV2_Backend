@@ -17,11 +17,15 @@ if TYPE_CHECKING:
 from loguru import logger
 
 from app.core.exceptions import ForbiddenException, NotFoundException, UnprocessableException
+from app.core.interactive_video import validate_interactive_video_ready, validate_interactive_video_timeline
 from app.core.document_extraction import DocumentExtractionError, extract_document_text
 from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
 from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage, get_lesson_audio_storage
 from app.core.youtube import fetch_video_duration_seconds
-from app.models.topic_content import LessonFlow, LearningObjective, SourceDocument, SourceDocumentKind, TopicContent, TranscriptState
+from app.models.topic_content import (
+    InteractiveVideoCheckpoint, LessonFlow, LearningObjective, SourceDocument,
+    SourceDocumentKind, TopicContent, TranscriptState,
+)
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.level_profile import LevelProfile
 from app.models.user import Role, User
@@ -121,11 +125,16 @@ class TopicContentService:
             else:
                 delivery = topic.at_revision(placement.published_revision)
 
-        # Interactive Video is deliberately author-only until its checkpoint
-        # timeline and playback implementation exists. This also protects any
-        # old/manual placement that predates the publication guard.
+        # Old/manual placements may predate the Interactive Video publication
+        # guard. Keep those malformed revisions out of student delivery.
         if delivery.lesson_flow == LessonFlow.INTERACTIVE_VIDEO:
-            raise ForbiddenException("Interactive Video lessons are not available to students yet")
+            try:
+                validate_interactive_video_ready(delivery)
+            except UnprocessableException as exc:
+                # A legacy/manual malformed placement must never become a
+                # partially functional student lesson merely because it
+                # predates the publication guard.
+                raise ForbiddenException("This Interactive Video lesson is not available yet") from exc
         return delivery
 
     async def _resolve_unit_id(self, unit_id: Optional[str], level, admin: User) -> Optional[str]:
@@ -344,9 +353,64 @@ class TopicContentService:
             changes["unit_id"] = await self._resolve_unit_id(
                 changes["unit_id"], changes.get("level", topic.level), admin
             )
+        # An exercise list and an Interactive Video timeline are one revision
+        # contract. Reject a dangling checkpoint before saving either side.
+        if "lesson_exercises" in changes and topic.lesson_flow == LessonFlow.INTERACTIVE_VIDEO:
+            validate_interactive_video_timeline(topic.interactive_video_checkpoints, changes["lesson_exercises"])
         if changes:
             changes.update(await self._start_content_revision(topic))
             await self.topic_repository.update_fields(topic_id, changes)
+        return await self.get_one(topic_id)
+
+    async def update_interactive_video_timeline(
+        self, topic_id: str, checkpoints: list[InteractiveVideoCheckpoint], admin: User
+    ) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if topic.lesson_flow != LessonFlow.INTERACTIVE_VIDEO:
+            raise UnprocessableException("Choose Interactive Video before editing its checkpoint timeline")
+        # The client submits an ordered list. Do not silently sort it: a
+        # mistake should be corrected by its author rather than changing the
+        # intended activity sequence behind their back.
+        validate_interactive_video_timeline(checkpoints, topic.lesson_exercises)
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(
+            topic_id,
+            {
+                "interactive_video_checkpoints": [item.model_dump() for item in checkpoints],
+                # A manual edit is an explicit teacher decision; stale AI
+                # proposals must never look like active checkpoints.
+                "interactive_video_drafts": [],
+                "interactive_video_draft_generation_key": None,
+                **revision,
+            },
+        )
+        return await self.get_one(topic_id)
+
+    async def accept_interactive_video_draft(self, topic_id: str, index: int, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if topic.lesson_flow != LessonFlow.INTERACTIVE_VIDEO:
+            raise UnprocessableException("Choose Interactive Video before accepting timeline suggestions")
+        if index < 0 or index >= len(topic.interactive_video_drafts):
+            raise NotFoundException("No such timeline suggestion")
+        selected = topic.interactive_video_drafts[index]
+        checkpoints = [*topic.interactive_video_checkpoints, InteractiveVideoCheckpoint(**selected.model_dump(exclude={"rationale"}))]
+        checkpoints.sort(key=lambda item: item.timestamp_seconds)
+        validate_interactive_video_timeline(checkpoints, topic.lesson_exercises)
+        drafts = [item.model_dump() for item_index, item in enumerate(topic.interactive_video_drafts) if item_index != index]
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "interactive_video_checkpoints": [item.model_dump() for item in checkpoints],
+            "interactive_video_drafts": drafts,
+            **revision,
+        })
+        return await self.get_one(topic_id)
+
+    async def reject_interactive_video_draft(self, topic_id: str, index: int, admin: User) -> TopicContent:
+        topic = await self.get_own_topic(topic_id, admin)
+        if index < 0 or index >= len(topic.interactive_video_drafts):
+            raise NotFoundException("No such timeline suggestion")
+        drafts = [item.model_dump() for item_index, item in enumerate(topic.interactive_video_drafts) if item_index != index]
+        await self.topic_repository.update_fields(topic_id, {"interactive_video_drafts": drafts})
         return await self.get_one(topic_id)
 
     async def update_learning_objectives(

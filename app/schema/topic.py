@@ -38,6 +38,8 @@ from app.models.topic_content import (
     LessonDraftExerciseSuggestion,
     LessonDraftJob,
     LessonFlow,
+    InteractiveVideoCheckpoint,
+    InteractiveVideoTimelineSuggestion,
     LearningObjective,
     ObjectiveSource,
     PracticeScheduleBlock,
@@ -297,6 +299,29 @@ class ObjectiveSuggestionPublic(BaseModel):
     crosses this boundary; accepting it is a separate teacher action."""
 
     text: str
+
+
+class InteractiveVideoTimelineUpdate(BaseModel):
+    """Full ordered teacher timeline replacement. The service validates it
+    against the Topic's real exercises before creating a new draft revision."""
+
+    checkpoints: Annotated[list[InteractiveVideoCheckpoint], Field(min_length=1, max_length=30)]
+
+
+class InteractiveVideoTimelineSuggestionPublic(BaseModel):
+    id: str
+    timestamp_seconds: float
+    exercise_index: int
+    completion_rule: str
+    rationale: str = ""
+
+    @classmethod
+    def from_suggestion(cls, item: InteractiveVideoTimelineSuggestion) -> "InteractiveVideoTimelineSuggestionPublic":
+        return cls(
+            id=item.id, timestamp_seconds=item.timestamp_seconds,
+            exercise_index=item.exercise_index, completion_rule=item.completion_rule.value,
+            rationale=item.rationale,
+        )
 
 
 class ApproveTranscriptRequest(BaseModel):
@@ -564,8 +589,13 @@ class TopicPublic(BaseSchema):
     objectives_approved: bool = False
     objective_drafts: list[LearningObjective] = Field(default_factory=list)
     # Authoring-only flow configuration. Interactive Video is publish-gated
-    # until the real checkpoint player exists.
+    # until it has a complete uploaded-video checkpoint timeline.
     lesson_flow: Optional[LessonFlow] = None
+    # Published Interactive Video pause plan. It contains no answer keys and
+    # is needed by the student player's native-video gate. AI drafts remain
+    # author-only in the internal block below.
+    interactive_video_checkpoints: list[InteractiveVideoCheckpoint] = Field(default_factory=list)
+    interactive_video_drafts: list[InteractiveVideoTimelineSuggestion] = Field(default_factory=list)
     # AI-suggested exercises awaiting teacher review (Slice C) - same
     # disclosure rule as avatar_prompt/raw_transcript: a draft is authoring
     # material, never shown to a student. See LessonDraftExerciseSuggestion.
@@ -602,6 +632,7 @@ class TopicPublic(BaseSchema):
                 "objectives_approved": topic.objectives_approved,
                 "objective_drafts": topic.objective_drafts,
                 "lesson_flow": topic.lesson_flow,
+                "interactive_video_drafts": topic.interactive_video_drafts,
                 "draft_exercises": topic.draft_exercises,
                 "lesson_draft_job": topic.lesson_draft_job,
             }
@@ -642,6 +673,7 @@ class TopicPublic(BaseSchema):
             # Administrator (`include_internal`) needs to see and edit
             # drafts, so they always get the full list regardless.
             learning_objectives=topic.learning_objectives if include_internal or topic.objectives_approved else [],
+            interactive_video_checkpoints=topic.interactive_video_checkpoints if topic.lesson_flow == LessonFlow.INTERACTIVE_VIDEO else [],
             lesson_status=lesson_status,
             session_minutes=session_minutes,
             created_by_id=topic.created_by_id,

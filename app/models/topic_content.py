@@ -8,6 +8,7 @@ re-hosting - so there is no media/hosting state here, only the transcript
 pipeline's state (captions or the Gemini fallback, see the platform plan §6).
 """
 
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Optional
@@ -229,13 +230,34 @@ class LearningObjective(BaseModel):
 
 
 class LessonFlow(str, Enum):
-    """Owner-approved lesson flows. `interactive_video` is persisted now so a
-    teacher's choice survives; its timestamp-based checkpoint timeline is a
-    later phase (see docs/ROADMAP.md) and until then the student experience
-    is the standard sequence for both values."""
+    """Owner-approved lesson flows. `interactive_video` uses a revisioned
+    teacher-owned checkpoint timeline with the native uploaded-video player;
+    see `app.core.interactive_video` for publish/delivery validation."""
 
     STANDARD = "standard"
     INTERACTIVE_VIDEO = "interactive_video"
+
+
+class InteractiveVideoCompletionRule(str, Enum):
+    """What unlocks an Interactive Video checkpoint."""
+
+    SUBMITTED = "submitted"
+    CORRECT = "correct"
+
+
+class InteractiveVideoCheckpoint(BaseModel):
+    """A pause point that references the exercise in this Topic revision."""
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    timestamp_seconds: float = Field(ge=0)
+    exercise_index: int = Field(ge=0)
+    completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
+
+
+class InteractiveVideoTimelineSuggestion(InteractiveVideoCheckpoint):
+    """Private AI proposal, never active until a teacher accepts it."""
+
+    rationale: str = Field(default="", max_length=500)
 
 
 class LessonDraftStepState(str, Enum):
@@ -346,6 +368,11 @@ class TopicContent(BaseDocument):
     # refuses to run while objectives exist but are not yet approved.
     objectives_approved: bool = False
     lesson_flow: LessonFlow = LessonFlow.STANDARD
+    # These stay on the reusable/versioned Topic. ProgramTopic pins a whole
+    # revision, so a draft timeline can never alter a live student's lesson.
+    interactive_video_checkpoints: list[InteractiveVideoCheckpoint] = Field(default_factory=list)
+    interactive_video_drafts: list[InteractiveVideoTimelineSuggestion] = Field(default_factory=list)
+    interactive_video_draft_generation_key: Optional[str] = None
 
     # Topic organization by unit + order (card #17). `unit_id` is `None` for
     # a legacy/unassigned topic - the UI groups those under an "Unassigned"

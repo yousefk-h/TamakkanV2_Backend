@@ -1,6 +1,7 @@
 """Program catalog permissions and student enrollment."""
 
 from app.core.security import hash_password
+from app.models.topic_content import TopicContent
 from app.models.user import Role, User
 from datetime import timedelta
 
@@ -159,7 +160,7 @@ async def test_one_topic_is_reused_in_two_programs_with_independent_placement(cl
     assert reassigned.json()["day"] is None
 
 
-async def test_interactive_video_flow_saves_but_cannot_be_published(client):
+async def test_interactive_video_requires_real_timeline_before_publish(client):
     admin, admin_headers = await _login(client, "flow-admin@example.com", Role.ADMINISTRATOR)
     teacher, teacher_headers = await _login(client, "flow-teacher@example.com", Role.TEACHER)
     program = client.post("/api/v1/programs", json={
@@ -168,6 +169,10 @@ async def test_interactive_video_flow_saves_but_cannot_be_published(client):
     }, headers=admin_headers).json()
     topic = client.post("/api/v1/topics", json={
         "title": "Interactive draft", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [{
+            "kind": "multiple_choice", "prompt": "Which word did you hear?",
+            "options": ["Hello", "Goodbye"], "correct_option": 0,
+        }],
     }, headers=teacher_headers)
     assert topic.status_code == 200, topic.text
     assert topic.json()["lesson_flow"] == "interactive_video"
@@ -176,10 +181,15 @@ async def test_interactive_video_flow_saves_but_cannot_be_published(client):
     }, headers=teacher_headers)
     assert blocked.status_code == 422
     assert "Interactive Video" in blocked.text
-    # Saving the design does not make the legacy Standard player unusable:
-    # switch explicitly, then the existing publish path is unchanged.
-    standard = client.patch(f"/api/v1/topics/{topic.json()['id']}", json={"lesson_flow": "standard"}, headers=teacher_headers)
-    assert standard.status_code == 200 and standard.json()["lesson_flow"] == "standard"
+    # A real uploaded video and a teacher-owned pause point are both required.
+    stored = await TopicContent.get(topic.json()["id"])
+    assert stored is not None
+    stored.uploaded_video_url = "https://cdn.example.test/interactive.mp4"
+    await stored.save()
+    timeline = client.put(f"/api/v1/topics/{topic.json()['id']}/interactive-video-timeline", json={
+        "checkpoints": [{"id": "first-pause", "timestamp_seconds": 12, "exercise_index": 0, "completion_rule": "submitted"}],
+    }, headers=teacher_headers)
+    assert timeline.status_code == 200, timeline.text
     published = client.post(f"/api/v1/programs/{program['id']}/topics", json={
         "topic_id": topic.json()["id"], "program_level_id": "beginner", "status": "published",
     }, headers=teacher_headers)

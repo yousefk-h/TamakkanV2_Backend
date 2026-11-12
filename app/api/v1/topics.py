@@ -38,6 +38,8 @@ from app.schema.topic import (
     TopicUpdate,
     LearningObjectivesUpdate,
     ObjectiveSuggestionPublic,
+    InteractiveVideoTimelineUpdate,
+    InteractiveVideoTimelineSuggestionPublic,
     TextSourceCreate,
     resolve_thumbnail_url,
 )
@@ -62,6 +64,7 @@ from app.services.enrollment_service import EnrollmentService, get_enrollment_se
 from app.services.exercise_draft_service import DraftExercisesRequest, DraftExercisesResponse, ExerciseDraftService, get_exercise_draft_service
 from app.services.lesson_draft_service import LessonDraftService, get_lesson_draft_service
 from app.services.objective_draft_service import ObjectiveDraftService, get_objective_draft_service
+from app.services.interactive_video_draft_service import InteractiveVideoDraftService, get_interactive_video_draft_service
 
 router = APIRouter()
 
@@ -209,6 +212,53 @@ async def update_topic(
     """
     topic = await service.update(topic_id, body, admin)
     return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.put("/topics/{topic_id}/interactive-video-timeline", response_model=TopicPublic)
+async def update_interactive_video_timeline(
+    topic_id: str,
+    body: InteractiveVideoTimelineUpdate,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    """Teacher-only draft authoring. A later Program publication pins this
+    complete timeline with its exact lesson revision."""
+    topic = await service.update_interactive_video_timeline(topic_id, body.checkpoints, teacher)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.post("/topics/{topic_id}/suggest-interactive-video-timeline", response_model=list[InteractiveVideoTimelineSuggestionPublic])
+async def suggest_interactive_video_timeline(
+    topic_id: str,
+    refresh: bool = Query(False, description="Explicitly replace pending checkpoint suggestions."),
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: InteractiveVideoDraftService = Depends(get_interactive_video_draft_service),
+) -> list[InteractiveVideoTimelineSuggestionPublic]:
+    """Teacher-only AI proposals. They remain private until individually accepted."""
+    return [
+        InteractiveVideoTimelineSuggestionPublic.from_suggestion(item)
+        for item in await service.draft(topic_id, teacher, refresh)
+    ]
+
+
+@router.post("/topics/{topic_id}/interactive-video-drafts/{index}/accept", response_model=TopicPublic)
+async def accept_interactive_video_suggestion(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    return TopicPublic.from_topic(await service.accept_interactive_video_draft(topic_id, index, teacher), include_internal=True)
+
+
+@router.post("/topics/{topic_id}/interactive-video-drafts/{index}/reject", response_model=TopicPublic)
+async def reject_interactive_video_suggestion(
+    topic_id: str,
+    index: int,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    return TopicPublic.from_topic(await service.reject_interactive_video_draft(topic_id, index, teacher), include_internal=True)
 
 
 @router.put("/topics/{topic_id}/objectives", response_model=TopicPublic)

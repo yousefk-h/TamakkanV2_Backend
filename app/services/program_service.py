@@ -3,6 +3,7 @@ from app.models.calendar_template import CalendarTemplate, TemplateKind
 from app.models.level_profile import LevelProfile
 from app.models.program import Program, ProgramLevelDefinition
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
+from app.core.interactive_video import validate_interactive_video_ready
 from app.models.topic_content import LessonFlow, Level, TopicContent
 from app.models.user import Role, User
 from app.schema.program import ProgramWrite
@@ -206,9 +207,7 @@ class ProgramService:
 
     async def _pin_current_revision(self, topic: TopicContent) -> int:
         if topic.lesson_flow == LessonFlow.INTERACTIVE_VIDEO:
-            raise UnprocessableException(
-                "Interactive Video cannot be published until checkpoint playback is available. Choose Standard to publish this lesson."
-            )
+            validate_interactive_video_ready(topic)
         if not any(snapshot.revision == topic.content_revision for snapshot in topic.revision_snapshots):
             topic.revision_snapshots.append(topic.make_revision_snapshot())
             await topic.save()

@@ -18,6 +18,7 @@ from app.services.progress_service import get_progress_service
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
 from app.services.exercise_draft_service import ExerciseDraftService, get_exercise_draft_service
 from app.services.objective_draft_service import ObjectiveDraftService, get_objective_draft_service
+from app.services.interactive_video_draft_service import InteractiveVideoDraftService, get_interactive_video_draft_service
 from app.schema.topic import LessonExerciseIn, TopicListItem
 from app.services.transcript_pipeline_service import (
     TranscriptPipelineService,
@@ -530,6 +531,56 @@ async def test_objective_suggestions_are_transient_and_cost_controlled(client):
     rejected = client.post(f"/api/v1/topics/{topic['id']}/objective-drafts/0/reject", headers=headers)
     assert rejected.status_code == 200
     assert rejected.json()["objective_drafts"] == []
+
+
+async def test_interactive_video_checkpoint_suggestions_stay_private_until_accepted(client):
+    from app.core.interactive_video_drafting import TimelineProposal
+
+    class FakeTimelineDrafter:
+        last_usage = None
+
+        def __init__(self):
+            self.calls = 0
+
+        async def draft(self, **kwargs):
+            self.calls += 1
+            assert "[0.0s-20.0s]" in kwargs["timestamped_source"]
+            return [TimelineProposal(timestamp_seconds=8, exercise_index=0, completion_rule="submitted", rationale="The greeting is introduced here.")]
+
+    teacher = await _login(client, Role.TEACHER, "interactive-ai@example.com")
+    other = await _login(client, Role.TEACHER, "interactive-ai-other@example.com")
+    headers = {"Authorization": f"Bearer {teacher}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [{"kind": "multiple_choice", "prompt": "What greeting did you hear?", "options": ["Hello", "Bye"], "correct_option": 0}],
+    }, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    assert stored is not None
+    stored.uploaded_video_url = "https://cdn.example.test/greetings.mp4"
+    stored.approved_transcript = "A greeting lesson with enough approved words for the teacher to review. " * 3
+    stored.raw_transcript = [TranscriptSegment(text="Hello and welcome to the lesson.", start=0, duration=20)]
+    await stored.save()
+
+    drafter = FakeTimelineDrafter()
+    app.dependency_overrides[get_interactive_video_draft_service] = lambda: InteractiveVideoDraftService(
+        get_topic_content_service(), drafter
+    )
+    try:
+        assert client.post(f"/api/v1/topics/{topic['id']}/suggest-interactive-video-timeline", headers={"Authorization": f"Bearer {other}"}).status_code == 403
+        first = client.post(f"/api/v1/topics/{topic['id']}/suggest-interactive-video-timeline", headers=headers)
+        second = client.post(f"/api/v1/topics/{topic['id']}/suggest-interactive-video-timeline", headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_interactive_video_draft_service, None)
+    assert first.status_code == 200, first.text
+    assert first.json()[0]["exercise_index"] == 0
+    assert second.status_code == 200 and drafter.calls == 1
+
+    before_acceptance = client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()
+    assert before_acceptance["interactive_video_checkpoints"] == []
+    accepted = client.post(f"/api/v1/topics/{topic['id']}/interactive-video-drafts/0/accept", headers=headers)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["interactive_video_checkpoints"][0]["timestamp_seconds"] == 8
+    assert accepted.json()["interactive_video_drafts"] == []
 
 
 async def test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request(client):
