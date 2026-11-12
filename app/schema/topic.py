@@ -359,6 +359,24 @@ class ReviewTranscriptEnglishRequest(BaseModel):
     transcript: Transcript
 
 
+class TranscriptSegmentsUpdate(BaseModel):
+    """Teacher edits to pending Gemini segments. Approval remains a separate,
+    explicit action; this endpoint never exposes drafts to Students."""
+
+    segments: Annotated[list[TranscriptSegment], Field(min_length=1, max_length=MAX_LIST_ITEMS)]
+
+    @model_validator(mode="after")
+    def valid_segments(self) -> "TranscriptSegmentsUpdate":
+        previous_end = 0.0
+        for segment in self.segments:
+            if not segment.text.strip() or segment.start < 0 or segment.duration <= 0:
+                raise ValueError("Each transcript segment needs text and valid timestamps")
+            if segment.start + 0.01 < previous_end:
+                raise ValueError("Transcript timestamps must stay in chronological order")
+            previous_end = segment.start + segment.duration
+        return self
+
+
 def resolve_thumbnail_url(topic: TopicContent) -> Optional[str]:
     """A manually-uploaded thumbnail always wins; otherwise falls back to the
     one derived for free from the lesson's first YouTube URL - `None` only
@@ -573,6 +591,7 @@ class TopicPublic(BaseSchema):
     # Gemini transcribing the video's audio - `None` before the first run
     # completes. See `TranscriptSource`.
     transcript_source: Optional[TranscriptSource] = None
+    transcript_error: Optional[str] = None
     # Video-optional lesson source (card #16) - `None`/empty when no PDF has
     # been uploaded. Same disclosure rule as `raw_transcript`: this is
     # authoring material, not something a Student reads directly.
@@ -625,6 +644,7 @@ class TopicPublic(BaseSchema):
                 "raw_transcript": topic.raw_transcript,
                 "transcript_source_labels": topic.transcript_source_labels,
                 "transcript_source": topic.transcript_source,
+                "transcript_error": topic.transcript_error,
                 "pdf_url": topic.pdf_url,
                 "pdf_filename": topic.pdf_filename,
                 "pdf_extracted_text": topic.pdf_extracted_text,

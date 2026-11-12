@@ -44,6 +44,7 @@ from app.schema.topic import (
     SourceVideoFinalize,
     SourceVideoUploadRequest,
     SourceVideoUploadSignature,
+    TranscriptSegmentsUpdate,
     resolve_thumbnail_url,
 )
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
@@ -582,7 +583,21 @@ async def generate_transcript(
     """
     await topic_service.get_own_topic(topic_id, admin)
     topic = await service.start_generation(topic_id)
-    background_tasks.add_task(service.run_generation, topic_id)
+    background_tasks.add_task(service.run_generation, topic_id, admin.id)
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.put("/topics/{topic_id}/transcript-segments", response_model=TopicPublic)
+async def save_transcript_segments(
+    topic_id: str,
+    body: TranscriptSegmentsUpdate,
+    admin: User = Depends(require_teacher_or_administrator),
+    service: TranscriptPipelineService = Depends(get_transcript_pipeline_service),
+    topic_service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    """Save teacher corrections to a pending transcript without approving it."""
+    await topic_service.get_own_topic(topic_id, admin)
+    topic = await service.save_review_segments(topic_id, body.segments)
     return TopicPublic.from_topic(topic, include_internal=True)
 
 

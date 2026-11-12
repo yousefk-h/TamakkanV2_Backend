@@ -61,6 +61,7 @@ class TranscriptSource(str, Enum):
 
     CAPTIONS = "captions"
     AI_GENERATED = "ai_generated"
+    GEMINI_VIDEO = "gemini_video"
     LOCAL_ASR = "local_asr"
     EXTRACTED_TEXT = "extracted_text"
     MIXED = "mixed"
@@ -405,6 +406,9 @@ class TopicContent(BaseDocument):
     # `TranscriptPipelineService` recognise a run as abandoned and reclaim it.
     # `None` in every other state.
     transcript_state_started_at: Optional[datetime] = None
+    # A short, teacher-safe recovery message. Provider diagnostics and source
+    # content stay in server logs and never leave the backend.
+    transcript_error: Optional[str] = None
     raw_transcript: list[TranscriptSegment] = Field(default_factory=list)
     # Parallel to `raw_transcript`: a short human-readable origin label for
     # each segment. Keeping labels separate preserves caption text verbatim

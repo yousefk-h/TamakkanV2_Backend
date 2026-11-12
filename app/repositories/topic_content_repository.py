@@ -119,6 +119,16 @@ class TopicContentRepository(BaseRepository[TopicContent]):
         ).update(Set({"transcript_state": target, **extra, "updated_at": utcnow()}))
         return result.matched_count == 1
 
+    async def update_pending_review_segments(self, topic_id: str, segments: list[Any]) -> bool:
+        """Persist teacher corrections only while a transcript is awaiting
+        review. A concurrent approval wins instead of being overwritten."""
+        result = await TopicContent.find_one(
+            TopicContent.id == topic_id,
+            TopicContent.is_deleted == False,  # noqa: E712
+            TopicContent.transcript_state == TranscriptState.PENDING_REVIEW,
+        ).update(Set({"raw_transcript": segments, "updated_at": utcnow()}))
+        return result.matched_count == 1
+
     async def find_ids_by_title(self, text: str, limit: int = 500) -> list[str]:
         """Ids of non-deleted topics whose title contains `text` (case-insensitive, literal - never a user regex)."""
         topics = await TopicContent.find(

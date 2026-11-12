@@ -859,3 +859,23 @@ async def test_approving_a_topic_with_no_transcript_is_rejected():
     fresh = await repository.get_by_id(topic.id)
     assert fresh.transcript_state == TranscriptState.PENDING_REVIEW
     assert fresh.approved_transcript is None
+
+
+async def test_teacher_can_save_timestamped_segment_corrections_before_approval():
+    topic = await _make_topic()
+    repository = TopicContentRepository()
+    await repository.update_fields(
+        topic.id,
+        {
+            "transcript_state": TranscriptState.PENDING_REVIEW,
+            "raw_transcript": [TranscriptSegment(text="هسه question one", start=0.0, duration=2.0)],
+        },
+    )
+
+    saved = await _make_service().save_review_segments(
+        topic.id,
+        [TranscriptSegment(text="هسه السؤال الأول", start=0.0, duration=2.0)],
+    )
+
+    assert saved.transcript_state == TranscriptState.PENDING_REVIEW
+    assert saved.raw_transcript[0].text == "هسه السؤال الأول"

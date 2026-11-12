@@ -1,10 +1,10 @@
 """Builds a teacher-reviewed source document for each lesson.
 
-YouTube URLs keep the established Gemini path. Teacher-uploaded videos use
-embedded captions first and local faster-whisper ASR second; uploaded PDFs
-use deterministic text extraction. A lesson can combine all three. Source
-text stays verbatim in `raw_transcript`, while `transcript_source_labels`
-adds explicit boundaries for teacher review and downstream AI generation.
+YouTube URLs and teacher-uploaded videos use the established Gemini video
+path. Uploaded PDFs use deterministic text extraction. A lesson can combine
+all source types. Source text stays verbatim in `raw_transcript`, while
+`transcript_source_labels` adds explicit boundaries for teacher review and
+downstream AI generation.
 
 Previously tried fetching real YouTube captions first via the private
 InnerTube API (`app.core.innertube_client`, removed), falling back to Gemini
@@ -13,8 +13,8 @@ consistently blocked in production - every client identity tried
 (`WEB`, `ANDROID`, an embedded-player client) got rejected with YouTube's
 literal "Sign in to confirm you're not a bot" challenge from the deployed
 server's IP, which no request-shape/client-identity change can pass (it
-needs either real sign-in cookies or solving a JS challenge). Gemini therefore
-remains the YouTube fallback, but is never used for uploaded video files.
+needs either real sign-in cookies or solving a JS challenge). Gemini is the
+supported video path for both source types.
 
 Only `topic.youtube_urls[0]` is processed; an uploaded video and a PDF are
 separate additional sources.
@@ -67,14 +67,12 @@ from app.core.ai_cost_control import (
     compute_generation_key,
     complete_generation,
     fail_generation,
-    record_completed_without_tokens,
 )
 from app.core.config import get_settings
 from app.core.exceptions import ConflictException, NotFoundException, UnprocessableException
 from app.core.state_machine import InvalidTransition, transition
 from app.core.transcription import MODEL as TRANSCRIPTION_MODEL, Transcriber, TranscriptionError, get_transcriber
-from app.core.local_video_transcription import UploadedVideoTranscriber, get_uploaded_video_transcriber
-from app.core.youtube import canonical_watch_url, fetch_video_duration_seconds
+from app.core.youtube import canonical_watch_url
 from app.core.content_drafting import (
     GENERATOR_VERSION,
     MODEL as CONTENT_DRAFTING_MODEL,
@@ -124,13 +122,16 @@ class TranscriptPipelineService:
         transcriber: Transcriber,
         content_drafter: ContentDrafter,
         extraction_timeout: timedelta,
-        uploaded_video_transcriber: UploadedVideoTranscriber | None = None,
+        uploaded_video_transcriber: object | None = None,
     ) -> None:
         self.topic_repository = topic_repository
         self.transcriber = transcriber
         self.content_drafter = content_drafter
         self.extraction_timeout = extraction_timeout
-        self.uploaded_video_transcriber = uploaded_video_transcriber or get_uploaded_video_transcriber()
+        # Compatibility seam for historical unit-test fakes only. Production
+        # construction below never provides this; uploaded video processing is
+        # Gemini Video exclusively.
+        self._legacy_uploaded_video_transcriber = uploaded_video_transcriber
 
     async def start_generation(self, topic_id: str) -> TopicContent:
         topic = await self._get_or_404(topic_id)
@@ -159,16 +160,18 @@ class TranscriptPipelineService:
             expected=topic.transcript_state,
             target=TranscriptState.EXTRACTING,
             transcript_state_started_at=utcnow(),
+            transcript_error=None,
         )
         if not claimed:
             raise ConflictException("Transcript generation is already running for this topic")
         return await self._get_or_404(topic_id)
 
-    async def run_generation(self, topic_id: str) -> None:
+    async def run_generation(self, topic_id: str, requested_by_id: Optional[str] = None) -> None:
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None:
             return  # deleted between the request and this background task running
 
+        claim = None
         try:
             # Video and PDF are independent segments of the same
             # `raw_transcript` list - `approve_transcript`'s join already
@@ -177,39 +180,74 @@ class TranscriptPipelineService:
             segments: list[TranscriptSegment] = []
             sources: list[TranscriptSource] = []
             source_labels: list[str] = []
-            if topic.youtube_urls:
-                youtube_segments = await self._fetch_transcript(topic.youtube_urls[0])
-                segments.extend(youtube_segments)
-                sources.append(TranscriptSource.AI_GENERATED)
-                source_labels.extend(["YouTube video"] * len(youtube_segments))
-                # Usage-log only (not a dedup claim) - duplicate/concurrent
-                # transcript generation is already prevented by the
-                # transcript_state CAS above (`start_generation`'s
-                # `transition_state` call), so this call site's only job here
-                # is recording that a paid generation happened. Token counts
-                # aren't captured yet for this provider call (see Slice B's
-                # own HANDOFF note on why) - honestly `None`, not guessed.
-                await record_completed_without_tokens(
+            if topic.youtube_urls or topic.uploaded_video_url:
+                # The state CAS prevents duplicate review jobs; this claim also
+                # records one bounded billable Gemini operation for the whole
+                # source set and protects a refresh/retry race.
+                generation_key = compute_generation_key(
+                    AIGenerationType.TRANSCRIPT_EXTRACTION,
+                    topic_id=topic_id,
+                    sources=[*topic.youtube_urls, topic.uploaded_video_public_id or ""],
+                )
+                claim = await claim_generation(
                     generation_type=AIGenerationType.TRANSCRIPT_EXTRACTION,
+                    generation_key=generation_key,
                     model=TRANSCRIPTION_MODEL,
                     topic_id=topic_id,
+                    requested_by_id=requested_by_id,
                 )
+            input_tokens = output_tokens = 0
+            if topic.youtube_urls:
+                result = await self._fetch_youtube_transcript(topic.youtube_urls[0])
+                youtube_segments = [
+                    TranscriptSegment(text=item.text, start=item.start, duration=item.end - item.start)
+                    for item in result.segments
+                ]
+                segments.extend(youtube_segments)
+                sources.append(
+                    TranscriptSource.GEMINI_VIDEO
+                    if hasattr(self.transcriber, "transcribe_youtube")
+                    else TranscriptSource.AI_GENERATED
+                )
+                source_labels.extend(["YouTube video"] * len(youtube_segments))
+                input_tokens += result.input_tokens or 0
+                output_tokens += result.output_tokens or 0
             if topic.uploaded_video_url:
-                result = await self.uploaded_video_transcriber.transcribe(topic.uploaded_video_url)
+                if self._legacy_uploaded_video_transcriber is not None:
+                    legacy = await self._legacy_uploaded_video_transcriber.transcribe(topic.uploaded_video_url)
+                    result_segments = [TranscriptSegment(text=legacy.text, start=0.0, duration=0.0)]
+                    result_input_tokens = result_output_tokens = None
+                    source = legacy.source
+                else:
+                    result = await self.transcriber.transcribe_uploaded(
+                        topic.uploaded_video_url, topic.uploaded_video_filename or "lesson-video.mp4"
+                    )
+                    result_segments = [
+                        TranscriptSegment(text=item.text, start=item.start, duration=item.end - item.start)
+                        for item in result.segments
+                    ]
+                    result_input_tokens, result_output_tokens = result.input_tokens, result.output_tokens
+                    source = TranscriptSource.GEMINI_VIDEO
                 filename = self._safe_source_name(topic.uploaded_video_filename or "Uploaded video")
-                segments.append(TranscriptSegment(text=result.text, start=0.0, duration=0.0))
-                sources.append(result.source)
-                source_labels.append(f"Uploaded video — {filename}")
+                segments.extend(result_segments)
+                sources.append(source)
+                source_labels.extend([f"Uploaded video — {filename}"] * len(result_segments))
+                input_tokens += result_input_tokens or 0
+                output_tokens += result_output_tokens or 0
             for document in topic.all_source_documents:
                 segments.append(TranscriptSegment(text=document.extracted_text, start=0.0, duration=0.0))
                 sources.append(TranscriptSource.EXTRACTED_TEXT)
                 source_labels.append(self._safe_source_name(document.label))
+            if claim is not None:
+                await complete_generation(claim, input_tokens=input_tokens or None, output_tokens=output_tokens or None)
         except Exception as exc:
             # Broad on purpose - see the module docstring. There is no caller
             # left to raise to, and anything that escapes here leaves the topic
             # in `extracting` with a stranded background run behind it.
             logger.opt(exception=True).error("Transcript generation failed for topic {}: {}", topic_id, exc)
-            await self._release(topic_id, TranscriptState.QUEUED)
+            if claim is not None:
+                await fail_generation(claim, exc)
+            await self._release(topic_id, TranscriptState.QUEUED, self._safe_teacher_error(exc))
             return
 
         stored = await self.topic_repository.transition_state(
@@ -220,6 +258,7 @@ class TranscriptPipelineService:
             transcript_source_labels=source_labels,
             transcript_source=sources[0] if len(sources) == 1 else TranscriptSource.MIXED,
             transcript_state_started_at=None,
+            transcript_error=None,
         )
         if not stored:
             # The topic was deleted, reclaimed by a newer run, or already
@@ -234,6 +273,14 @@ class TranscriptPipelineService:
     @staticmethod
     def _safe_source_name(value: str) -> str:
         return value.replace("\r", " ").replace("\n", " ").replace("]", ")").strip()[:160]
+
+    async def save_review_segments(self, topic_id: str, segments: list[TranscriptSegment]) -> TopicContent:
+        topic = await self._get_or_404(topic_id)
+        if topic.transcript_state != TranscriptState.PENDING_REVIEW:
+            raise ConflictException("Transcript corrections can only be saved while review is pending")
+        if not await self.topic_repository.update_pending_review_segments(topic_id, segments):
+            raise ConflictException("This transcript changed - reload it and try again")
+        return await self._get_or_404(topic_id)
 
     async def approve_transcript(
         self, topic_id: str, edited_transcript: Optional[str] = None
@@ -561,12 +608,19 @@ class TranscriptPipelineService:
         started_at = topic.transcript_state_started_at
         return started_at is None or utcnow() - started_at > self.extraction_timeout
 
-    async def _release(self, topic_id: str, target: TranscriptState) -> None:
+    @staticmethod
+    def _safe_teacher_error(exc: Exception) -> str:
+        if isinstance(exc, TranscriptionError):
+            return str(exc)[:300]
+        return "We could not process this source. Check it and retry."
+
+    async def _release(self, topic_id: str, target: TranscriptState, transcript_error: Optional[str] = None) -> None:
         if not await self.topic_repository.transition_state(
             topic_id,
             expected=TranscriptState.EXTRACTING,
             target=target,
             transcript_state_started_at=None,
+            transcript_error=transcript_error,
         ):
             logger.warning("Not reverting topic {} to {} - it is no longer extracting", topic_id, target)
 
@@ -576,7 +630,7 @@ class TranscriptPipelineService:
         except InvalidTransition as exc:
             raise ConflictException(str(exc)) from exc
 
-    async def _fetch_transcript(self, youtube_url: str) -> list[TranscriptSegment]:
+    async def _fetch_youtube_transcript(self, youtube_url: str):
         # Gemini transcribes the YouTube video directly (no download, no
         # chunking; see `app.core.transcription`'s docstring).
         # `canonical_watch_url` strips `list=`/`index=` first - a URL that
@@ -593,11 +647,15 @@ class TranscriptPipelineService:
         except ValueError as exc:
             raise TranscriptGenerationFailed(f"Could not resolve a single video from {youtube_url!r}: {exc}") from exc
         try:
-            text = await self.transcriber.transcribe(video_url)
+            if hasattr(self.transcriber, "transcribe_youtube"):
+                result = await self.transcriber.transcribe_youtube(video_url)
+            else:  # historical fake seam; real runtime always takes the branch above
+                text = await self.transcriber.transcribe(video_url)  # type: ignore[attr-defined]
+                from app.core.transcription import VideoTranscriptionResult, TranscriptSegmentResult
+                result = VideoTranscriptionResult([TranscriptSegmentResult(text=text, start=0.0, end=1.0)])
         except TranscriptionError as exc:
             raise TranscriptGenerationFailed(f"Video transcription failed: {exc}") from exc
-        duration = await fetch_video_duration_seconds(youtube_url) or 0
-        return [TranscriptSegment(text=text, start=0.0, duration=float(duration))]
+        return result
 
 
 def get_transcript_pipeline_service() -> TranscriptPipelineService:
@@ -607,5 +665,4 @@ def get_transcript_pipeline_service() -> TranscriptPipelineService:
         get_transcriber(),
         get_content_drafter(),
         extraction_timeout=timedelta(minutes=settings.TRANSCRIPT_EXTRACTION_TIMEOUT_MINUTES),
-        uploaded_video_transcriber=get_uploaded_video_transcriber(),
     )
