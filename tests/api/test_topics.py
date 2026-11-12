@@ -145,6 +145,64 @@ async def test_teacher_can_author_and_reorder_lesson_exercises(client):
     assert student_view.json()["avatar_prompt"] is None
 
 
+async def test_lesson_exercises_support_mixed_legacy_and_new_kinds_end_to_end(client):
+    """Regression for the Slice 5 integration report: a teacher saves a lesson
+    mixing pre-existing kinds (multiple_choice/reading/game) with the new
+    ones (word_order/error_correction/dialogue_completion) in one PATCH, the
+    whole list round-trips after a reload, survives a reorder, and - once the
+    topic is actually placed on an activated calendar (this app's real
+    "publish" step, same as `test_teacher_can_author_and_reorder_lesson_exercises`
+    above) - a Student sees every kind with its answer key masked."""
+    token = await _login(client, Role.TEACHER, "mixed-kinds-teacher@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    created = client.post("/api/v1/topics", json={"title": "Mixed kinds lesson", "level": "intermediate"}, headers=headers)
+    assert created.status_code == 200
+    topic_id = created.json()["id"]
+    exercises = [
+        {"kind": "multiple_choice", "prompt": "Pick one", "options": ["a", "b"], "correct_option": 0, "explanation": ""},
+        {"kind": "reading", "prompt": "Read this", "options": ["Early", "Late"], "correct_option": 0, "explanation": "", "content": "Maya wakes up early."},
+        {"kind": "game", "prompt": "Match", "options": [], "correct_option": None, "explanation": "", "pairs": [{"left": "hi", "right": "hello"}, {"left": "bye", "right": "goodbye"}]},
+        {"kind": "word_order", "prompt": "Put in order", "options": [], "correct_option": None, "explanation": "", "ordering_words": ["Maya", "wakes", "up", "early"]},
+        {"kind": "error_correction", "prompt": "Fix it", "options": [], "correct_option": None, "explanation": "Tense", "content": "Maya wake up early.", "accepted_answers": ["Maya wakes up early."]},
+        {"kind": "dialogue_completion", "prompt": "Complete it", "options": [], "correct_option": None, "explanation": "",
+         "dialogue_turns": [{"speaker": "A", "text": "What time do you wake up?", "is_blank": False, "accepted_answers": []},
+                            {"speaker": "B", "text": "", "is_blank": True, "accepted_answers": ["I wake up early."]}]},
+    ]
+    kinds = [item["kind"] for item in exercises]
+
+    saved = client.patch(f"/api/v1/topics/{topic_id}", json={"lesson_exercises": exercises}, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert [item["kind"] for item in saved.json()["lesson_exercises"]] == kinds
+
+    reloaded = client.get(f"/api/v1/topics/{topic_id}", headers=headers).json()
+    assert [item["kind"] for item in reloaded["lesson_exercises"]] == kinds
+    assert reloaded["lesson_exercises"][3]["ordering_words"] == ["Maya", "wakes", "up", "early"]
+    assert reloaded["lesson_exercises"][5]["dialogue_turns"][1]["accepted_answers"] == ["I wake up early."]
+
+    reordered = client.patch(f"/api/v1/topics/{topic_id}", json={"lesson_exercises": exercises[::-1]}, headers=headers)
+    assert reordered.status_code == 200
+    assert [item["kind"] for item in reordered.json()["lesson_exercises"]] == kinds[::-1]
+
+    from app.utils.time import utcnow
+    teacher_id = client.get("/api/v1/me", headers=headers).json()["id"]
+    student_token = await _login(client, Role.STUDENT, "mixed-kinds-student@example.com", plan=PlanType.STANDARD,
+                                 assigned_level=Level.INTERMEDIATE, program_start_date=utcnow(), created_by_id=teacher_id)
+    template = client.post("/api/v1/calendar-templates", json={"name": "Mixed kinds plan", "kind": "standard", "level": "intermediate",
+                                                           "days": [{"day": 1, "topic_ids": [topic_id]}]}, headers=headers)
+    assert template.status_code == 200
+    activated = client.post(f"/api/v1/calendar-templates/{template.json()['id']}/activate", headers=headers)
+    assert activated.status_code == 200
+
+    student_view = client.get(f"/api/v1/topics/{topic_id}", headers={"Authorization": f"Bearer {student_token}"}).json()
+    student_kinds = [item["kind"] for item in student_view["lesson_exercises"]]
+    assert sorted(student_kinds) == sorted(kinds[::-1]), "every new kind reaches the Student alongside the old ones"
+    by_kind = {item["kind"]: item for item in student_view["lesson_exercises"]}
+    assert by_kind["word_order"]["ordering_words"] != ["Maya", "wakes", "up", "early"], "answer key stays masked"
+    assert sorted(by_kind["word_order"]["ordering_words"]) == ["Maya", "early", "up", "wakes"]
+    assert by_kind["error_correction"]["accepted_answers"] == []
+    assert by_kind["dialogue_completion"]["dialogue_turns"][1]["accepted_answers"] == []
+
+
 async def test_lesson_exercises_reject_incomplete_answer_keys(client):
     token = await _login(client, Role.TEACHER, "invalid-exercise@example.com")
     headers = {"Authorization": f"Bearer {token}"}
