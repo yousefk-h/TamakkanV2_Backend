@@ -219,8 +219,10 @@ class ObjectiveSource(str, Enum):
 
 class LearningObjective(BaseModel):
     """What the STUDENT should be able to say or do by the end - written by
-    the teacher, or AI-suggested and then explicitly accepted. It is
-    teacher-only curriculum metadata; student delivery never exposes it."""
+    the teacher, or AI-suggested and then explicitly accepted. Delivered to
+    the Student themselves (Course Content) once `objectives_approved` is
+    true - see `app.schema.topic.TopicPublic.from_topic`; a draft is
+    authoring-only until then."""
 
     text: str
     source: ObjectiveSource = ObjectiveSource.MANUAL

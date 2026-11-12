@@ -456,6 +456,46 @@ async def test_learning_objectives_are_ordered_reviewed_and_gate_ai_drafting(cli
     assert "objectives" in blocked.text.lower()
 
 
+async def test_a_student_sees_learning_objectives_only_once_approved(client):
+    """Course Content (Priority 2 of the E2E brief): a Student should see
+    this lesson's approved Learning Objectives, never a draft - the field
+    used to be internal-only (never sent to a Student at all, approved or
+    not), which is why Course Content always looked empty."""
+    from app.utils.time import utcnow
+
+    teacher_token = await _login(client, Role.TEACHER, "objectives-student-view-teacher@example.com")
+    teacher_headers = {"Authorization": f"Bearer {teacher_token}"}
+    teacher_id = client.get("/api/v1/me", headers=teacher_headers).json()["id"]
+    created = client.post("/api/v1/topics", json={"title": "Directions", "level": "intermediate"}, headers=teacher_headers).json()
+    topic_id = created["id"]
+    saved = client.put(f"/api/v1/topics/{topic_id}/objectives", json={"objectives": [
+        {"text": "Ask for directions to a place.", "source": "manual"},
+    ]}, headers=teacher_headers)
+    assert saved.status_code == 200, saved.text
+
+    template = client.post(
+        "/api/v1/calendar-templates",
+        json={"name": "T", "kind": "standard", "level": "intermediate", "days": [{"day": 1, "topic_ids": [topic_id]}]},
+        headers=teacher_headers,
+    ).json()
+    client.post(f"/api/v1/calendar-templates/{template['id']}/activate", headers=teacher_headers)
+    student_token = await _login(
+        client, Role.STUDENT, "objectives-student-view@example.com",
+        plan=PlanType.STANDARD, assigned_level=Level.INTERMEDIATE, program_start_date=utcnow(), created_by_id=teacher_id,
+    )
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+
+    before_approval = client.get(f"/api/v1/topics/{topic_id}", headers=student_headers).json()
+    assert before_approval["learning_objectives"] == [], "unapproved objectives must never reach a Student"
+
+    approved = client.post(f"/api/v1/topics/{topic_id}/objectives/approve", headers=teacher_headers)
+    assert approved.status_code == 200, approved.text
+
+    after_approval = client.get(f"/api/v1/topics/{topic_id}", headers=student_headers).json()
+    assert [item["text"] for item in after_approval["learning_objectives"]] == ["Ask for directions to a place."]
+    assert after_approval["objective_drafts"] == [], "drafts stay authoring-only regardless of approval"
+
+
 async def test_objective_suggestions_are_transient_and_cost_controlled(client):
     class FakeObjectiveDrafter:
         last_usage = None

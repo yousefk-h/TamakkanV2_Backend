@@ -20,6 +20,7 @@ from app.core.challenge import CHALLENGE_TOTAL_DAYS, END_OF_WEEK_CHECKIN_DAYS
 from app.models.calendar_template import CalendarTemplate, TemplateKind
 from app.models.cohort import Cohort
 from app.models.enrollment import Enrollment, EnrollmentStatus
+from app.models.program import Program
 from app.models.live_session import LiveSession, SessionState
 from app.models.recording_submission import RecordingSubmission
 from app.models.topic_content import TopicContent
@@ -351,6 +352,8 @@ class ProgressService:
         total_days = template.duration_days if template else CHALLENGE_TOTAL_DAYS
         challenge_day = _program_today(effective_start, total_days)
         milestones = [ChallengeMilestone(day=d, reached=challenge_day >= d) for d in CHALLENGE_MILESTONE_DAYS]
+        _program_id, program_name = await self._resolve_program_context(student)
+        has_multiple_enrollments = await self._has_multiple_active_enrollments(student)
 
         today = utcnow().date()
         active_date_set = set(active_dates)
@@ -363,6 +366,8 @@ class ProgressService:
             challenge_day=challenge_day,
             challenge_total_days=total_days,
             program_start_date=effective_start.date() if effective_start else None,
+            program_name=program_name,
+            has_multiple_enrollments=has_multiple_enrollments,
             last_7_days_active=last_7_days_active,
             last_7_days_dates=[today - timedelta(days=offset) for offset in range(6, -1, -1)],
             badges=badges,
@@ -407,6 +412,31 @@ class ProgressService:
         cohort = await Cohort.find_one({"_id": enrollment.cohort_id}) if enrollment.cohort_id else None
         anchor = EnrollmentService.schedule_anchor_date(enrollment, cohort) or enrollment.joined_at
         return template, anchor
+
+    async def _resolve_program_context(self, student: User) -> tuple[Optional[str], Optional[str]]:
+        """(program_id, program_name) for whichever Program this student's
+        single calendar actually belongs to - legacy `program_id` first, then
+        the same single-active-Enrollment fallback `_resolve_template` uses.
+        `program_id` is `None` for a student with 0 or 2+ active enrollments
+        and no legacy program either (see `has_multiple_enrollments` on
+        `StudentProgress` for how the frontend tells those two apart)."""
+        program_id = student.program_id
+        if program_id is None:
+            active = await Enrollment.find({
+                "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
+            }).to_list()
+            if len(active) == 1:
+                program_id = active[0].program_id
+        if program_id is None:
+            return None, None
+        program = await Program.find_one({"_id": program_id, "is_deleted": False})
+        return program_id, program.name if program else None
+
+    async def _has_multiple_active_enrollments(self, student: User) -> bool:
+        count = await Enrollment.find({
+            "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
+        }).count()
+        return count > 1
 
     async def _effective_program_start_date(self, student: User) -> Optional[datetime]:
         """`student.program_start_date` when set (legacy path, unchanged);

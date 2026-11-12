@@ -50,6 +50,18 @@ class StudentProgress(BaseModel):
     # assigned. Lets the frontend show "starts {date}" when `challenge_day`
     # is `0` instead of a confusing "Day 0."
     program_start_date: Optional[date] = None
+    # The real Program this challenge_day/calendar belongs to - `None` only
+    # when genuinely nothing resolved (no plan, no Enrollment at all). Lets
+    # the frontend say "{program_name} Learning Journey" instead of a
+    # generic, program-agnostic "30-Day Challenge" label.
+    program_name: Optional[str] = None
+    # True when this student holds 2+ active Enrollments - `_resolve_template`
+    # deliberately never guesses which one this single-calendar page should
+    # show in that case (every other field above is then `None`/`0`, the
+    # same as "no plan"). The frontend uses this to point the student to
+    # "My Learning" (which lists every enrollment separately) instead of
+    # implying they have no plan at all.
+    has_multiple_enrollments: bool = False
     # Oldest to newest, always exactly 7 entries, the 7th being today - the
     # weekly dot tracker's data, not a display-ready label set (the frontend
     # already owns day-of-week formatting via the locale).

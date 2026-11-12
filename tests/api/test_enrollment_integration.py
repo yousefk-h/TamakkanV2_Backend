@@ -392,8 +392,39 @@ async def test_a_student_enrolled_only_through_a_cohort_sees_their_topics_and_pr
     progress = client.get("/api/v1/me/progress", headers=student_headers).json()
     assert progress["program_start_date"] is not None
     assert progress["challenge_day"] == 1
+    # Task 3/4 follow-up: the Journey badge and the Cohort header must agree
+    # with each other and with reality, not show "0 students"/generic
+    # 30-Day-Challenge branding for a student the Cohort itself already lists.
+    assert progress["program_name"] == "General English"
+    assert progress["has_multiple_enrollments"] is False
 
     calendar = client.get("/api/v1/me/challenge-calendar", headers=student_headers).json()
     assert calendar["has_template"] is True
     day1 = next(slot for slot in calendar["lesson_days"] if slot["day"] == 1)
     assert [t["topic_id"] for t in day1["topics"]] == [topic["id"]]
+
+    cohort_view = client.get(f"/api/v1/cohorts/{cohort['id']}", headers=admin_headers).json()
+    assert cohort_view["student_count"] == 1
+
+
+async def test_a_student_with_two_active_enrollments_never_guesses_a_single_journey(client):
+    """The Learning Journey/Student Home page is a single-calendar view - a
+    student holding two active Enrollments (two Programs, or two Cohorts of
+    one Program) must see an explicit "multiple Programs" state, not a
+    silently-picked first enrollment and not a false "no plan" message."""
+    admin, admin_headers = await _login(client, "multi-journey-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "multi-journey-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "multi-journey-student@example.com", Role.STUDENT, created_by_id=admin.id)
+
+    general = _create_program(client, admin_headers, "multi-journey-general", "General English")
+    business = _create_program(client, admin_headers, "multi-journey-business", "Business English")
+    general_stage, business_stage = _stage_id(general), _stage_id(business)
+    general_cohort = _create_cohort(client, admin_headers, name="General Batch", program=general, stage_id=general_stage, lead_teacher_id=teacher.id)
+    business_cohort = _create_cohort(client, admin_headers, name="Business Batch", program=business, stage_id=business_stage, lead_teacher_id=teacher.id)
+    _enroll(client, admin_headers, general_cohort["id"], student.id, general_stage)
+    _enroll(client, admin_headers, business_cohort["id"], student.id, business_stage)
+
+    progress = client.get("/api/v1/me/progress", headers=student_headers).json()
+    assert progress["has_multiple_enrollments"] is True
+    assert progress["program_name"] is None
+    assert progress["program_start_date"] is None

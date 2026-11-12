@@ -557,8 +557,9 @@ class TopicPublic(BaseSchema):
     # Additional uploaded/pasted authoring sources.  Never included in a
     # Student response because their extracted text is not reviewed content.
     source_documents: Optional[list[SourceDocument]] = None
-    # Authoring-only. Students never receive objectives (approved or not),
-    # avoiding disclosure of AI/teacher curriculum metadata.
+    # A Student receives this list once a teacher has approved it - same
+    # disclosure rule `from_topic` applies to `approved_transcript` - never a
+    # draft. `objective_drafts` just below stays authoring-only regardless.
     learning_objectives: list[LearningObjective] = Field(default_factory=list)
     objectives_approved: bool = False
     objective_drafts: list[LearningObjective] = Field(default_factory=list)
@@ -598,7 +599,6 @@ class TopicPublic(BaseSchema):
                 "pdf_filename": topic.pdf_filename,
                 "pdf_extracted_text": topic.pdf_extracted_text,
                 "source_documents": topic.source_documents,
-                "learning_objectives": topic.learning_objectives,
                 "objectives_approved": topic.objectives_approved,
                 "objective_drafts": topic.objective_drafts,
                 "lesson_flow": topic.lesson_flow,
@@ -636,6 +636,12 @@ class TopicPublic(BaseSchema):
             # a teacher has approved it - it's `None` until that happens
             # regardless of role, so this alone can't leak an unreviewed one.
             approved_transcript=topic.approved_transcript,
+            # Same rule as `approved_transcript` above, applied to objectives
+            # instead of a null check: a Student only ever sees this list once
+            # `objectives_approved` is true, never a draft. A Teacher/
+            # Administrator (`include_internal`) needs to see and edit
+            # drafts, so they always get the full list regardless.
+            learning_objectives=topic.learning_objectives if include_internal or topic.objectives_approved else [],
             lesson_status=lesson_status,
             session_minutes=session_minutes,
             created_by_id=topic.created_by_id,
