@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 from app.core.challenge import CHALLENGE_TOTAL_DAYS, END_OF_WEEK_CHECKIN_DAYS
 from app.models.calendar_template import CalendarTemplate, TemplateKind
 from app.models.cohort import Cohort
+from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.live_session import LiveSession, SessionState
 from app.models.recording_submission import RecordingSubmission
 from app.models.topic_content import TopicContent
@@ -346,8 +347,9 @@ class ProgressService:
         ]
 
         template = await self._resolve_template(student)
+        effective_start = await self._effective_program_start_date(student)
         total_days = template.duration_days if template else CHALLENGE_TOTAL_DAYS
-        challenge_day = _program_today(student.program_start_date, total_days)
+        challenge_day = _program_today(effective_start, total_days)
         milestones = [ChallengeMilestone(day=d, reached=challenge_day >= d) for d in CHALLENGE_MILESTONE_DAYS]
 
         today = utcnow().date()
@@ -360,7 +362,7 @@ class ProgressService:
             total_active_days=len(active_dates),
             challenge_day=challenge_day,
             challenge_total_days=total_days,
-            program_start_date=student.program_start_date.date() if student.program_start_date else None,
+            program_start_date=effective_start.date() if effective_start else None,
             last_7_days_active=last_7_days_active,
             last_7_days_dates=[today - timedelta(days=offset) for offset in range(6, -1, -1)],
             badges=badges,
@@ -368,6 +370,55 @@ class ProgressService:
         )
 
     async def _resolve_template(self, student: User) -> Optional[CalendarTemplate]:
+        """The calendar this student actually follows. Tries the legacy
+        `plan`/`program_id`/`assigned_level` path first (zero behavior change
+        for every account that predates Cohorts/Enrollments); a student
+        enrolled ONLY through a Cohort - no `assign_plan` call ever made for
+        them - falls back to their single active Enrollment's effective
+        schedule, the same canonical resolution `EnrollmentService`/"My
+        Learning" already uses. See `_resolve_enrollment_fallback` for why
+        this never guesses among several active enrollments."""
+        legacy = await self._resolve_legacy_template(student)
+        if legacy is not None:
+            return legacy
+        fallback = await self._resolve_enrollment_fallback(student)
+        return fallback[0] if fallback else None
+
+    async def _resolve_enrollment_fallback(self, student: User) -> Optional[tuple[CalendarTemplate, datetime]]:
+        """(template, anchor date) from the student's Enrollment, for a
+        student with no usable legacy plan at all. Deliberately `None` for 0
+        or 2+ active enrollments: Student Home/the Challenge page is a
+        single-calendar view and must never guess which one to show - a
+        multi-enrollment student already has the enrollment-aware "My
+        Learning" page (`EnrollmentService`) for exactly that case."""
+        active = await Enrollment.find({
+            "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
+        }).to_list()
+        if len(active) != 1:
+            return None
+        enrollment = active[0]
+        template = await self.calendar_template_repository.get_effective_schedule(
+            enrollment.program_id, enrollment.program_level_id, enrollment.cohort_id
+        )
+        if template is None:
+            return None
+        from app.services.enrollment_service import EnrollmentService  # local import avoids a module cycle at import time
+
+        cohort = await Cohort.find_one({"_id": enrollment.cohort_id}) if enrollment.cohort_id else None
+        anchor = EnrollmentService.schedule_anchor_date(enrollment, cohort) or enrollment.joined_at
+        return template, anchor
+
+    async def _effective_program_start_date(self, student: User) -> Optional[datetime]:
+        """`student.program_start_date` when set (legacy path, unchanged);
+        otherwise the single-enrollment fallback's anchor date, so the
+        Challenge day/date and the day-by-day calendar agree with whatever
+        template `_resolve_template` actually picked."""
+        if student.program_start_date is not None:
+            return student.program_start_date
+        fallback = await self._resolve_enrollment_fallback(student)
+        return fallback[1] if fallback else None
+
+    async def _resolve_legacy_template(self, student: User) -> Optional[CalendarTemplate]:
         """The calendar this student actually follows: a Standard student
         follows whichever template their own admin has activated for their
         level; a Pro student follows the specific template their admin
@@ -455,7 +506,8 @@ class ProgressService:
         """
         template = await self._resolve_template(student)
         sessions = _for_current_enrollment(student, await self.session_repository.get_all_for_student(student.id))
-        return _build_schedule(template, sessions, student.program_start_date)
+        effective_start = await self._effective_program_start_date(student)
+        return _build_schedule(template, sessions, effective_start)
 
     async def get_topic_statuses(self, student: User) -> dict[str, LessonDayState]:
         """Thin wrapper used by `app.core.entitlement` - see
@@ -533,7 +585,8 @@ class ProgressService:
         template = await self._resolve_template(student)
         sessions = _for_current_enrollment(student, await self.session_repository.get_all_for_student(student.id))
         submissions = _for_current_enrollment(student, await self.submission_repository.get_all_for_student(student.id))
-        return _build_alerts(template, sessions, submissions, student.program_start_date)
+        effective_start = await self._effective_program_start_date(student)
+        return _build_alerts(template, sessions, submissions, effective_start)
 
     async def get_alerts_for_students(self, students: list[User]) -> dict[str, StudentAlerts]:
         """The admin roster's badge - one batched query per collection

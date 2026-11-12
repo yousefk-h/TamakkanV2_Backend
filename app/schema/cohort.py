@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.models.cohort import Cohort, CohortStatus, CohortTeacherAssignment
+from app.models.cohort import Cohort, CohortStatus
 from app.schema.base import BaseSchema
 from app.schema.limits import MAX_TITLE_LENGTH
 
@@ -43,12 +43,22 @@ class CohortUpdate(BaseModel):
     status: Optional[CohortStatus] = None
 
 
+class CohortTeacherAssignmentPublic(BaseModel):
+    teacher_id: str
+    program_level_ids: list[str]
+    # Display-only denormalization, same rule as `lead_teacher_name` below:
+    # `None` means the account is gone/unavailable (deleted, or - in theory -
+    # never existed) - the frontend must show a graceful placeholder, never
+    # fall back to rendering `teacher_id` itself as the label.
+    teacher_name: Optional[str] = None
+
+
 class CohortPublic(BaseSchema):
     name: str
     program_id: str
     program_level_ids: list[str]
     lead_teacher_id: str
-    teacher_assignments: list[CohortTeacherAssignment]
+    teacher_assignments: list[CohortTeacherAssignmentPublic]
     start_date: datetime
     end_date: Optional[datetime]
     status: CohortStatus
@@ -66,8 +76,14 @@ class CohortPublic(BaseSchema):
         student_count: int = 0,
         accessible_program_level_ids: Optional[list[str]] = None,
         lead_teacher_name: Optional[str] = None,
+        teacher_names_by_id: Optional[dict[str, str]] = None,
     ) -> "CohortPublic":
+        names = teacher_names_by_id or {}
         data = item.model_dump()
+        data["teacher_assignments"] = [
+            {**assignment, "teacher_name": names.get(assignment["teacher_id"])}
+            for assignment in data["teacher_assignments"]
+        ]
         return cls.model_validate({
             **data,
             "student_count": student_count,

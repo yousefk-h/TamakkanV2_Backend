@@ -359,3 +359,41 @@ async def test_two_cohorts_of_one_program_give_independent_session_entitlement(c
 
     blocked = client.post("/api/v1/sessions/start", json={"topic_id": topic["id"], "enrollment_id": enrollment_b}, headers=headers_b)
     assert blocked.status_code == 403, blocked.text
+
+
+async def test_a_student_enrolled_only_through_a_cohort_sees_their_topics_and_progress(client):
+    """Regression: a student enrolled purely via POST /cohorts/{id}/students
+    (no UserService.assign_plan call ever made for them, so `plan`/
+    `program_id`/`assigned_level`/`program_start_date` are all still unset)
+    used to see an empty topics list and a "no plan" Challenge/progress page,
+    even though their Cohort enrollment (and "My Learning") already worked -
+    exactly the Cohort/Enrollment inconsistency reported against the owner's
+    manual walkthrough. `ProgressService` must now fall back to the single
+    active Enrollment's effective schedule and anchor date."""
+    admin, admin_headers = await _login(client, "cohort-only-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "cohort-only-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "cohort-only-student@example.com", Role.STUDENT, created_by_id=admin.id)
+    assert student.plan is None
+    assert student.program_id is None
+    assert student.program_start_date is None
+
+    program = _create_program(client, admin_headers, "cohort-only-english", "General English")
+    stage = _stage_id(program)
+    cohort = _create_cohort(client, admin_headers, name="Cohort Only Batch", program=program, stage_id=stage, lead_teacher_id=teacher.id)
+    _enroll(client, admin_headers, cohort["id"], student.id, stage)
+
+    topic = _create_published_topic(client, teacher_headers, admin_headers, program, stage, "Cohort Only Lesson")
+    template_id = _cohort_calendar_id(client, admin_headers, cohort["id"])
+    _schedule_topic_day1(client, admin_headers, template_id, topic["id"])
+
+    topics = client.get("/api/v1/topics", headers=student_headers).json()
+    assert [t["id"] for t in topics] == [topic["id"]]
+
+    progress = client.get("/api/v1/me/progress", headers=student_headers).json()
+    assert progress["program_start_date"] is not None
+    assert progress["challenge_day"] == 1
+
+    calendar = client.get("/api/v1/me/challenge-calendar", headers=student_headers).json()
+    assert calendar["has_template"] is True
+    day1 = next(slot for slot in calendar["lesson_days"] if slot["day"] == 1)
+    assert [t["topic_id"] for t in day1["topics"]] == [topic["id"]]

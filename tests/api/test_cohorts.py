@@ -223,6 +223,35 @@ async def test_multi_level_cohort_scopes_each_teacher_to_their_own_stage(client)
     assert client.get(f"/api/v1/cohorts/{cohort['id']}", headers=outsider_headers).status_code == 403
 
 
+async def test_cohort_response_resolves_teacher_names_and_never_leaks_a_raw_id(client):
+    """Regression: the Cohort Teachers tab was rendering a raw teacher_id
+    whenever a name couldn't be resolved. `CohortPublic` now denormalizes a
+    `teacher_name` onto the lead and every assignment server-side; a deleted
+    teacher account must resolve to `None` (a graceful "unavailable"
+    placeholder on the frontend), never to the id itself."""
+    admin, admin_headers = await _login(client, "names-admin@example.com", Role.ADMINISTRATOR)
+    lead, _ = await _login(client, "names-lead@example.com", Role.TEACHER)
+    gone, _ = await _login(client, "names-gone@example.com", Role.TEACHER)
+
+    program = _create_program(client, admin_headers, "names-general-english", "General English")
+    beginner = _stage_id(program, "beginner")
+    cohort = _create_cohort(
+        client, admin_headers, name="Name Resolution Batch", program=program, stage_ids=[beginner],
+        lead_teacher_id=lead.id,
+        teacher_assignments=[{"teacher_id": gone.id, "program_level_ids": [beginner]}],
+    )
+    assert cohort["lead_teacher_name"] == lead.full_name
+    assert cohort["teacher_assignments"][0]["teacher_name"] == gone.full_name
+
+    gone_doc = await User.get(gone.id)
+    gone_doc.is_deleted = True
+    await gone_doc.save()
+
+    reloaded = client.get(f"/api/v1/cohorts/{cohort['id']}", headers=admin_headers).json()
+    assert reloaded["teacher_assignments"][0]["teacher_name"] is None
+    assert reloaded["teacher_assignments"][0]["teacher_id"] == gone.id, "the id itself is preserved for permissions"
+
+
 async def test_enrolling_a_non_student_or_outside_the_cohorts_stages_is_rejected(client):
     admin, admin_headers = await _login(client, "reject-admin@example.com", Role.ADMINISTRATOR)
     teacher, _ = await _login(client, "reject-teacher@example.com", Role.TEACHER)

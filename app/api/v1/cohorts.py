@@ -19,10 +19,13 @@ router = APIRouter()
 
 
 async def _public_cohort(cohort, student_count: int = 0, stages: list[str] | None = None) -> CohortPublic:
-    teacher = await User.find_one({"_id": cohort.lead_teacher_id, "is_deleted": False})
+    teacher_ids = {cohort.lead_teacher_id, *(a.teacher_id for a in cohort.teacher_assignments)}
+    teachers = await User.find({"_id": {"$in": list(teacher_ids)}, "is_deleted": False}).to_list()
+    names_by_id = {teacher.id: teacher.full_name for teacher in teachers}
     return CohortPublic.from_cohort(
         cohort, student_count, stages,
-        lead_teacher_name=teacher.full_name if teacher else None,
+        lead_teacher_name=names_by_id.get(cohort.lead_teacher_id),
+        teacher_names_by_id=names_by_id,
     )
 
 
