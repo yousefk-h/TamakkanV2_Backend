@@ -34,6 +34,12 @@ def test_loopback_mongo_is_accepted(uri: str) -> None:
     assert local_mode_violations(**{**GOOD, "mongodb_uri": uri}) == []
 
 
+def test_v2_docker_mongo_requires_an_explicit_local_opt_in() -> None:
+    uri = "mongodb://tamakkan-v2-mongo:27017"
+    assert local_mode_violations(**{**GOOD, "mongodb_uri": uri})
+    assert local_mode_violations(**{**GOOD, "mongodb_uri": uri, "allow_docker_local_mongo": True}) == []
+
+
 @pytest.mark.parametrize("url", ["wss://tamakkan-agent-m4zc52ik.livekit.cloud", "wss://ielets-dajbgqlm.livekit.cloud"])
 def test_production_livekit_projects_are_rejected(url: str) -> None:
     assert local_mode_violations(**{**GOOD, "livekit_url": url})

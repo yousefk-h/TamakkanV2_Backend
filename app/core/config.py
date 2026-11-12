@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # Local development only: makes startup refuse any production database/LiveKit
     # configuration. See app/core/local_guard.py.
     LOCAL_DEV_MODE: bool = False
+    # Docker containers have their own loopback. This explicit local-only flag
+    # allows the guarded V2 Mongo service name, never an arbitrary host.
+    ALLOW_DOCKER_LOCAL_MONGO: bool = False
     ENVIRONMENT: str = "development"
     API_PREFIX: str = "/api"
 
@@ -63,6 +66,7 @@ class Settings(BaseSettings):
                 livekit_url=getattr(self, "LIVEKIT_URL", "") or "",
                 livekit_agent_name=getattr(self, "LIVEKIT_AGENT_NAME", "") or "",
                 email_delivery_mode=self.EMAIL_DELIVERY_MODE,
+                allow_docker_local_mongo=self.ALLOW_DOCKER_LOCAL_MONGO,
             )
             if problems:
                 raise ValueError("LOCAL_DEV_MODE safeguards: " + "; ".join(problems))

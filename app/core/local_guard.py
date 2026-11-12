@@ -16,6 +16,9 @@ from typing import Iterable
 from urllib.parse import urlsplit
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+# Docker Desktop containers cannot reach the host's loopback address. This
+# exact service name is reserved for Tamakkan V2's local Mongo container.
+LOCAL_DOCKER_MONGO_HOST = "tamakkan-v2-mongo"
 # Databases that hold (or are planned to hold) real data. Compared case-insensitively:
 # MongoDB treats names differing only by case as the same database on most servers.
 # Every other production database is already rejected by LOCAL_DB_PREFIX below.
@@ -50,12 +53,16 @@ def local_mode_violations(
     livekit_agent_name: str = "",
     email_delivery_mode: str = "",
     backend_api_url: str = "",
+    allow_docker_local_mongo: bool = False,
 ) -> list[str]:
     problems: list[str] = []
     if mongodb_uri.startswith("mongodb+srv://"):
         problems.append("MONGODB_URI uses mongodb+srv:// (a hosted cluster); local mode allows only a loopback MongoDB")
     else:
-        bad = [h for h in _mongo_hosts(mongodb_uri) if h.lower() not in LOOPBACK_HOSTS]
+        allowed_hosts = set(LOOPBACK_HOSTS)
+        if allow_docker_local_mongo:
+            allowed_hosts.add(LOCAL_DOCKER_MONGO_HOST)
+        bad = [h for h in _mongo_hosts(mongodb_uri) if h.lower() not in allowed_hosts]
         if bad or not _mongo_hosts(mongodb_uri):
             problems.append(f"MONGODB_URI host(s) {bad or ['<none>']} are not loopback (127.0.0.1/localhost)")
     name = mongodb_db_name.strip()
@@ -105,6 +112,7 @@ def main(argv: Iterable[str]) -> int:
         livekit_agent_name=v.get("LIVEKIT_AGENT_NAME") or "",
         email_delivery_mode=v.get("EMAIL_DELIVERY_MODE") or "",
         backend_api_url=v.get("BACKEND_API_URL") or "",
+        allow_docker_local_mongo=(v.get("ALLOW_DOCKER_LOCAL_MONGO") or "").lower() in {"1", "true", "yes"},
     )
     if (v.get("LOCAL_DEV_MODE") or "").lower() not in {"1", "true", "yes"}:
         problems.append("LOCAL_DEV_MODE=true is not set in this env file")
