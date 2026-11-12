@@ -106,10 +106,19 @@ class ExerciseAttemptHistoryItem(BaseModel):
     exercise_index: int
     exercise_kind: ExerciseKind
     exercise_prompt: str
-    answer: int | str | list[int]
+    # Same widened shape as `ExerciseAttempt.answer`/`ExerciseAttemptPublic`
+    # (Slice 5: word_order/game submit the actual word/text list, not an
+    # index) - this was still the pre-Slice-5 `int | str | list[int]` here,
+    # so reading the history of any of those kinds raised a ValidationError.
+    answer: int | str | list[int] | list[str]
     answer_display: str
     correct: Optional[bool] = None
     correct_option: Optional[int] = None
+    # The true answer, in the same display shape as `answer_display` - lets
+    # a Teacher see what was actually right next to what the student wrote,
+    # instead of only a correct/incorrect icon. `None` for an open-ended
+    # kind (writing/speaking/reflection) with no single right answer.
+    correct_answer_display: Optional[str] = None
     score: Optional[int] = None
     reviewed: bool = False
     superseded: bool = False

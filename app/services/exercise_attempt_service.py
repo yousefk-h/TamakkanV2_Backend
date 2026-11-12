@@ -42,6 +42,29 @@ def exercise_hash(exercise: LessonExercise) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def correct_answer_display(exercise: LessonExercise) -> str:
+    """The TRUE answer, in the same display shape `submit()` builds for a
+    student's own `answer_display` above - used only for an already-
+    authorized Teacher/Admin reading a student's attempt history (see
+    `StudentProgressService.get_exercise_history`), never sent to a
+    Student. `""` for an open-ended kind (writing/speaking/reflection)
+    with no single correct answer to show."""
+    if exercise.kind in CHOICE_KINDS:
+        if exercise.correct_option is None or not 0 <= exercise.correct_option < len(exercise.options):
+            return ""
+        return exercise.options[exercise.correct_option]
+    if exercise.kind == ExerciseKind.GAME:
+        return "; ".join(f"{pair.left} → {pair.right}" for pair in exercise.pairs)
+    if exercise.kind in ORDER_KINDS:
+        return " ".join(exercise.ordering_words)
+    if exercise.kind == ExerciseKind.ERROR_CORRECTION:
+        return " / ".join(exercise.accepted_answers)
+    if exercise.kind == ExerciseKind.DIALOGUE_COMPLETION:
+        blanks = [turn for turn in exercise.dialogue_turns if turn.is_blank]
+        return " | ".join(" / ".join(blank.accepted_answers) for blank in blanks)
+    return ""
+
+
 class ExerciseAttemptService:
     def __init__(self, topics: TopicContentService, enrollments: EnrollmentService) -> None:
         self.topics = topics

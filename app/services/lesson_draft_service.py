@@ -223,7 +223,9 @@ class LessonDraftService:
                 logger.opt(exception=True).warning(
                     "Lesson draft exercise step failed for topic {} kind {}: {}", topic_id, kind.value, exc
                 )
-                await self._set_job_field(topic_id, exercise_kind=kind, state=LessonDraftStepState.FAILED)
+                await self._set_job_field(
+                    topic_id, exercise_kind=kind, state=LessonDraftStepState.FAILED, error=str(exc) or exc.__class__.__name__,
+                )
 
         final = await self.topic_repository.get_by_id(topic_id)
         if final is None or final.lesson_draft_job is None:
@@ -340,6 +342,7 @@ class LessonDraftService:
         content_step: Optional[LessonDraftStepState] = None,
         exercise_kind: Optional[ExerciseKind] = None,
         state: Optional[LessonDraftStepState] = None,
+        error: Optional[str] = None,
     ) -> None:
         current = await self.topic_repository.get_by_id(topic_id)
         if current is None or current.lesson_draft_job is None:
@@ -349,6 +352,10 @@ class LessonDraftService:
             job["content_step"] = content_step
         if exercise_kind is not None and state is not None:
             job["exercise_steps"][exercise_kind.value] = state
+            if state == LessonDraftStepState.FAILED and error is not None:
+                job["exercise_step_errors"][exercise_kind.value] = error
+            elif state != LessonDraftStepState.FAILED:
+                job["exercise_step_errors"].pop(exercise_kind.value, None)
         await self.topic_repository.update_fields(topic_id, {"lesson_draft_job": job})
 
     async def accept_suggestion(self, topic_id: str, index: int, teacher: User) -> TopicContent:

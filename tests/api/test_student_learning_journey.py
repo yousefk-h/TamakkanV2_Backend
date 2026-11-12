@@ -84,6 +84,53 @@ async def test_learning_journey_aggregates_enrollment_schedule_and_graded_exerci
     assert sum(1 for item in history_body if item["superseded"]) == 1
 
 
+async def test_exercise_history_for_word_order_and_game_attempts_does_not_crash(client):
+    """Regression: `ExerciseAttemptHistoryItem.answer` was still the
+    pre-Slice-5 `int | str | list[int]` - reading the history of a
+    word_order or game attempt (both submit `list[str]`) raised a Pydantic
+    ValidationError. Also confirms the new `correct_answer_display` shows
+    the true answer for a Teacher, separate from what the student wrote."""
+    admin, admin_headers = await _login(client, "journey-wo-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "journey-wo-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "journey-wo-student@example.com", Role.STUDENT, created_by_id=admin.id)
+
+    program = _create_program(client, admin_headers, "journey-wo-program", "Journey WO Program")
+    beginner = _stage_id(program, "beginner")
+    cohort = _create_cohort(client, admin_headers, name="Journey WO Batch", program=program, stage_ids=[beginner], lead_teacher_id=teacher.id)
+    enrolled = client.post(f"/api/v1/cohorts/{cohort['id']}/students", json={"student_ids": [student.id], "program_level_id": beginner}, headers=admin_headers)
+    assert enrolled.status_code == 201, enrolled.text
+    enrollment_id = enrolled.json()[0]["id"]
+
+    topic = client.post("/api/v1/topics", json={
+        "title": "Word Order Lesson", "level": "beginner",
+        "lesson_exercises": [{"kind": "word_order", "prompt": "Put in order", "ordering_words": ["I", "like", "tea"]}],
+    }, headers=teacher_headers)
+    assert topic.status_code == 200, topic.text
+    topic_id = topic.json()["id"]
+    assigned = client.post(f"/api/v1/cohorts/{cohort['id']}/topics", json={"topic_id": topic_id, "program_level_id": beginner, "status": "published"}, headers=teacher_headers)
+    assert assigned.status_code == 201, assigned.text
+    await _schedule_topic_on_cohort(client, teacher_headers, cohort, beginner, topic_id)
+
+    student_topic = client.get(f"/api/v1/topics/{topic_id}", params={"enrollment_id": enrollment_id}, headers=student_headers).json()
+    revision = student_topic["updated_at"]
+    delivered_words = student_topic["lesson_exercises"][0]["ordering_words"]
+
+    attempt = client.post("/api/v1/exercise-attempts", json={
+        "topic_id": topic_id, "exercise_index": 0, "topic_updated_at": revision,
+        "answer": delivered_words, "enrollment_id": enrollment_id,
+    }, headers=student_headers)
+    assert attempt.status_code == 201, attempt.text
+    assert attempt.json()["correct"] is False, "delivered order is scrambled, never the true one"
+
+    history = client.get(f"/api/v1/users/{student.id}/exercise-history",
+                         params={"topic_id": topic_id, "enrollment_id": enrollment_id}, headers=teacher_headers)
+    assert history.status_code == 200, history.text
+    item = history.json()[0]
+    assert item["answer"] == delivered_words
+    assert item["correct"] is False
+    assert item["correct_answer_display"] == "I like tea"
+
+
 async def test_a_teacher_not_assigned_to_the_students_cohort_is_refused(client):
     admin, admin_headers = await _login(client, "journey-perm-admin@example.com", Role.ADMINISTRATOR)
     teacher, teacher_headers = await _login(client, "journey-perm-teacher@example.com", Role.TEACHER)

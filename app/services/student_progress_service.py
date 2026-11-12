@@ -15,6 +15,7 @@ from app.models.exercise_attempt import ExerciseAttempt
 from app.models.homework import Homework
 from app.models.live_session import LiveSession
 from app.models.program import Program
+from app.models.topic_content import TopicContent
 from app.models.user import Role, User
 from app.schema.enrollment import EnrollmentPublic
 from app.schema.student_progress import (
@@ -28,6 +29,7 @@ from app.schema.student_progress import (
 )
 from app.services.cohort_service import CohortService, accessible_stage_ids
 from app.services.enrollment_service import EnrollmentService
+from app.services.exercise_attempt_service import correct_answer_display
 
 
 class StudentProgressService:
@@ -192,12 +194,22 @@ class StudentProgressService:
         if enrollment_id is not None:
             query["enrollment_id"] = enrollment_id
         attempts = await ExerciseAttempt.find(query).sort("-created_at").to_list()
+        # The caller is already authorized to see this student's full
+        # history (role/Enrollment check above) - fetching the real,
+        # unmasked lesson_exercises here (never the student-masked view) is
+        # exactly what lets `correct_answer_display` show the true answer.
+        topic = await TopicContent.get(topic_id)
+        exercises = topic.lesson_exercises if topic is not None else []
         return [
             ExerciseAttemptHistoryItem(
                 id=a.id, created_at=a.created_at, exercise_index=a.exercise_index, exercise_kind=a.exercise_kind,
                 exercise_prompt=a.exercise_prompt, answer=a.answer, answer_display=a.answer_display,
-                correct=a.correct, correct_option=a.correct_option, score=a.score, reviewed=a.reviewed,
-                superseded=a.superseded, feedback=a.feedback,
+                correct=a.correct, correct_option=a.correct_option,
+                correct_answer_display=(
+                    correct_answer_display(exercises[a.exercise_index]) or None
+                    if 0 <= a.exercise_index < len(exercises) else None
+                ),
+                score=a.score, reviewed=a.reviewed, superseded=a.superseded, feedback=a.feedback,
             )
             for a in attempts
         ]

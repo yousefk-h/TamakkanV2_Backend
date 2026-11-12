@@ -119,11 +119,31 @@ def validate_exercise_suggestion(
         for text in objectives:
             objective_words |= _keywords(text)
         objective_overlap = len(exercise_words & objective_words)
-        if objective_overlap < MIN_OBJECTIVE_OVERLAP:
+        # A real learning objective is near-always written as a skill/
+        # grammar description ("describe a daily routine using simple
+        # present tense"), not in the exercise's own subject vocabulary - a
+        # short, well-grounded exercise (word_order's one sentence,
+        # dialogue_completion's terse turns) can legitimately share zero
+        # literal words with that phrasing while still serving it exactly.
+        # Confirmed: this literal-overlap check rejected clearly on-topic
+        # drafts of every kind, not only the two reported, whenever the
+        # objective was phrased this normal way. Strong grounding in the
+        # Teacher's own approved source - which the objective was written
+        # for - is itself real evidence of alignment, so it satisfies this
+        # check when literal objective-keyword overlap doesn't.
+        objective_aligned = objective_overlap >= MIN_OBJECTIVE_OVERLAP or grounding_overlap >= MIN_GROUNDING_OVERLAP
+        if not objective_aligned:
             issues.append(QualityIssue(
                 "not_objective_aligned",
                 "This exercise doesn't connect to any approved learning objective",
             ))
+        # Deliberately the STRICT literal-overlap check here, not
+        # `objective_aligned` above: a trivial what/when/who question being
+        # grounded in the source is exactly the case this must still catch
+        # (e.g. "What time did Maya wake up?" shares words with the source
+        # but has nothing to do with an unrelated objective) - only a real
+        # objective-keyword match, not mere source grounding, excuses that
+        # phrasing.
         if _TRIVIAL_RECALL_RE.match(prompt) and objective_overlap < MIN_OBJECTIVE_OVERLAP:
             issues.append(QualityIssue(
                 "trivial_recall",

@@ -208,6 +208,11 @@ async def test_a_failed_exercise_kind_does_not_block_the_others_and_can_be_retri
     assert after_failure["lesson_draft_job"]["state"] == "failed"
     assert set(after_failure["lesson_draft_job"]["exercise_steps"].values()) == {"failed"}
     assert after_failure["draft_exercises"] == []
+    # The actual reason, per kind - not just a bare "Failed" badge - so a
+    # Teacher can see why before deciding whether to retry.
+    step_errors = after_failure["lesson_draft_job"]["exercise_step_errors"]
+    assert set(step_errors.keys()) == {"multiple_choice", "reading", "grammar"}
+    assert all(message == "boom" for message in step_errors.values())
 
     # Retry: a working drafter now succeeds, with no record of the earlier
     # failed attempts blocking it (failed attempts are never appended to

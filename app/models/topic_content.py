@@ -279,6 +279,12 @@ class LessonDraftJob(BaseModel):
     state: LessonDraftStepState = LessonDraftStepState.PENDING
     content_step: LessonDraftStepState = LessonDraftStepState.PENDING
     exercise_steps: dict[str, LessonDraftStepState] = Field(default_factory=dict)
+    # Populated only for a kind whose `exercise_steps` entry is FAILED - the
+    # actual reason (a quality-gate rejection's specific issue codes, a
+    # provider error, or a budget/quota message), so a Teacher can see WHY a
+    # specific kind failed instead of just a bare "Failed" badge, and judge
+    # whether retrying that one kind alone is worth another AI call.
+    exercise_step_errors: dict[str, str] = Field(default_factory=dict)
     planned_calls: int = 0
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
