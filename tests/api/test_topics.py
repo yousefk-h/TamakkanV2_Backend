@@ -737,6 +737,116 @@ async def test_rejecting_a_practice_with_mariam_draft_adds_no_checkpoint(client)
     assert rejected.json()["interactive_video_drafts"] == []
 
 
+async def test_accept_all_interactive_video_drafts_accepts_every_valid_draft(client):
+    from app.models.topic_content import CheckpointKind, InteractiveVideoCompletionRule, InteractiveVideoTimelineSuggestion
+
+    token = await _login(client, Role.TEACHER, "accept-all@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [
+            {"kind": "multiple_choice", "prompt": "Q1?", "options": ["A", "B"], "correct_option": 0},
+            {"kind": "multiple_choice", "prompt": "Q2?", "options": ["A", "B"], "correct_option": 0},
+            {"kind": "multiple_choice", "prompt": "Q3?", "options": ["A", "B"], "correct_option": 0},
+        ],
+    }, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    assert stored is not None
+    stored.uploaded_video_url = "https://cdn.example.test/greetings.mp4"
+    stored.interactive_video_drafts = [
+        InteractiveVideoTimelineSuggestion(
+            timestamp_seconds=5, checkpoint_kind=CheckpointKind.EXERCISE, exercise_index=0,
+            completion_rule=InteractiveVideoCompletionRule.SUBMITTED, rationale="r1",
+        ),
+        InteractiveVideoTimelineSuggestion(
+            timestamp_seconds=10, checkpoint_kind=CheckpointKind.EXERCISE, exercise_index=1,
+            completion_rule=InteractiveVideoCompletionRule.SUBMITTED, rationale="r2",
+        ),
+        InteractiveVideoTimelineSuggestion(
+            timestamp_seconds=15, checkpoint_kind=CheckpointKind.EXERCISE, exercise_index=2,
+            completion_rule=InteractiveVideoCompletionRule.SUBMITTED, rationale="r3",
+        ),
+    ]
+    await stored.save()
+
+    result = client.post(f"/api/v1/topics/{topic['id']}/interactive-video-drafts/accept-all", headers=headers)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["accepted_count"] == 3
+    assert body["failures"] == []
+
+    refreshed = client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()
+    assert refreshed["interactive_video_drafts"] == []
+    assert len(refreshed["interactive_video_checkpoints"]) == 3
+    assert sorted(cp["timestamp_seconds"] for cp in refreshed["interactive_video_checkpoints"]) == [5, 10, 15]
+
+
+async def test_accept_all_interactive_video_drafts_reports_failures_and_keeps_successes(client):
+    from app.models.topic_content import CheckpointKind, InteractiveVideoCompletionRule, InteractiveVideoTimelineSuggestion
+
+    token = await _login(client, Role.TEACHER, "accept-all-partial@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [
+            {"kind": "multiple_choice", "prompt": "Q1?", "options": ["A", "B"], "correct_option": 0},
+            {"kind": "multiple_choice", "prompt": "Q2?", "options": ["A", "B"], "correct_option": 0},
+        ],
+    }, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    assert stored is not None
+    stored.uploaded_video_url = "https://cdn.example.test/greetings.mp4"
+    stored.interactive_video_drafts = [
+        InteractiveVideoTimelineSuggestion(
+            timestamp_seconds=5, checkpoint_kind=CheckpointKind.EXERCISE, exercise_index=0,
+            completion_rule=InteractiveVideoCompletionRule.SUBMITTED, rationale="r1",
+        ),
+        # Invalid: no such lesson exercise at index 99.
+        InteractiveVideoTimelineSuggestion(
+            timestamp_seconds=10, checkpoint_kind=CheckpointKind.EXERCISE, exercise_index=99,
+            completion_rule=InteractiveVideoCompletionRule.SUBMITTED, rationale="bad",
+        ),
+        InteractiveVideoTimelineSuggestion(
+            timestamp_seconds=15, checkpoint_kind=CheckpointKind.EXERCISE, exercise_index=1,
+            completion_rule=InteractiveVideoCompletionRule.SUBMITTED, rationale="r3",
+        ),
+    ]
+    await stored.save()
+
+    result = client.post(f"/api/v1/topics/{topic['id']}/interactive-video-drafts/accept-all", headers=headers)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["accepted_count"] == 2
+    assert len(body["failures"]) == 1
+    assert body["failures"][0]["index"] == 1
+    assert body["failures"][0]["timestamp_seconds"] == 10
+    assert body["failures"][0]["reason"]
+
+    # Re-fetch and confirm the 2 valid ones are genuinely persisted, not rolled back.
+    refreshed = client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()
+    assert sorted(cp["timestamp_seconds"] for cp in refreshed["interactive_video_checkpoints"]) == [5, 15]
+    assert refreshed["interactive_video_drafts"] == []
+
+
+async def test_accept_all_interactive_video_drafts_rejects_wrong_role_and_wrong_teacher(client):
+    owner_token = await _login(client, Role.TEACHER, "accept-all-owner@example.com")
+    other_token = await _login(client, Role.TEACHER, "accept-all-other@example.com")
+    student_token = await _login(client, Role.STUDENT, "accept-all-student@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=owner_headers).json()
+
+    assert client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-drafts/accept-all",
+        headers={"Authorization": f"Bearer {student_token}"},
+    ).status_code == 403
+    assert client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-drafts/accept-all",
+        headers={"Authorization": f"Bearer {other_token}"},
+    ).status_code == 403
+
+
 async def test_teacher_can_convert_an_exercise_checkpoint_to_practice_with_mariam(client):
     token = await _login(client, Role.TEACHER, "convert-checkpoint@example.com")
     headers = {"Authorization": f"Bearer {token}"}

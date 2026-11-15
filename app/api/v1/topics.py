@@ -51,6 +51,7 @@ from app.schema.topic import (
 from app.schema.live_session import CheckpointSessionStatus
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.services.topic_content_service import (
+    AcceptAllDraftsResult,
     MAX_PDF_UPLOAD_BYTES,
     MAX_SOURCE_DOCUMENT_UPLOAD_BYTES,
     MAX_SOURCE_VIDEO_UPLOAD_BYTES,
@@ -266,6 +267,21 @@ async def reject_interactive_video_suggestion(
     service: TopicContentService = Depends(get_topic_content_service),
 ) -> TopicPublic:
     return TopicPublic.from_topic(await service.reject_interactive_video_draft(topic_id, index, teacher), include_internal=True)
+
+
+@router.post("/topics/{topic_id}/interactive-video-drafts/accept-all", response_model=AcceptAllDraftsResult)
+async def accept_all_interactive_video_suggestions(
+    topic_id: str,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> AcceptAllDraftsResult:
+    """Accept every pending Interactive Video timeline draft in one action.
+
+    Continues past any individual draft's validation failure rather than
+    aborting the whole batch; every failure is reported, never dropped
+    silently. Makes no AI provider call itself.
+    """
+    return await service.accept_all_interactive_video_drafts(topic_id, teacher)
 
 
 @router.post(

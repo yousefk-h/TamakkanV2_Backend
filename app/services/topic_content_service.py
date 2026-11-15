@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from app.services.enrollment_service import EnrollmentContext
 
 from loguru import logger
+from pydantic import BaseModel
 
 from app.core.exceptions import ForbiddenException, NotFoundException, UnprocessableException
 from app.core.interactive_video import validate_interactive_video_ready, validate_interactive_video_timeline
@@ -52,6 +53,20 @@ MAX_SOURCE_DOCUMENTS = 12
 CLOUDINARY_SOURCE_DOCUMENT_FOLDER = "Tamakkan/topic-source-documents"
 MAX_SOURCE_VIDEO_UPLOAD_BYTES = 80 * 1024 * 1024
 CLOUDINARY_SOURCE_VIDEO_FOLDER = "Tamakkan/topic-videos"
+
+
+class AcceptAllDraftsFailure(BaseModel):
+    """One Interactive Video timeline draft that `accept_all_interactive_video_drafts`
+    could not accept - reported, never silently dropped."""
+
+    index: int
+    timestamp_seconds: float
+    reason: str
+
+
+class AcceptAllDraftsResult(BaseModel):
+    accepted_count: int
+    failures: list[AcceptAllDraftsFailure] = []
 
 
 class TopicContentService:
@@ -439,6 +454,47 @@ class TopicContentService:
             **revision,
         })
         return await self.get_one(topic_id)
+
+    async def accept_all_interactive_video_drafts(self, topic_id: str, admin: User) -> AcceptAllDraftsResult:
+        """Accept every pending Interactive Video timeline draft in one action.
+
+        Each individual `accept_interactive_video_draft` call is already
+        atomic (one `update_fields` call). This loop keeps going on a
+        per-draft failure (e.g. a `series`-kind proposal that fails
+        `validate_interactive_video_timeline`, or a timestamp collision with
+        another checkpoint accepted earlier in this same batch) instead of
+        aborting the whole batch, and never rolls back prior successes. It
+        makes no AI provider call itself - it only persists already-drafted
+        suggestions - so no new generation-lock/budget wiring is needed.
+        """
+        topic = await self.get_own_topic(topic_id, admin)
+        if topic.lesson_flow != LessonFlow.INTERACTIVE_VIDEO:
+            raise UnprocessableException("Choose Interactive Video before accepting timeline suggestions")
+        # Snapshot which drafts to process (and their original order) up
+        # front. Indices shift as each accept succeeds, so every iteration
+        # re-reads current state and locates each draft by its stable `id`
+        # rather than assuming a cached index is still valid.
+        draft_ids = [item.id for item in topic.interactive_video_drafts]
+        accepted_count = 0
+        failures: list[AcceptAllDraftsFailure] = []
+        for original_index, draft_id in enumerate(draft_ids):
+            current = await self.get_own_topic(topic_id, admin)
+            index = next((i for i, item in enumerate(current.interactive_video_drafts) if item.id == draft_id), None)
+            if index is None:
+                # Already resolved by an earlier iteration; nothing to do.
+                continue
+            draft = current.interactive_video_drafts[index]
+            try:
+                await self.accept_interactive_video_draft(topic_id, index, admin)
+                accepted_count += 1
+            except (UnprocessableException, NotFoundException) as exc:
+                failures.append(AcceptAllDraftsFailure(
+                    index=original_index, timestamp_seconds=draft.timestamp_seconds, reason=str(exc),
+                ))
+                # Drop only this one failing draft so the batch can make
+                # progress; prior and later successes are untouched.
+                await self.reject_interactive_video_draft(topic_id, index, admin)
+        return AcceptAllDraftsResult(accepted_count=accepted_count, failures=failures)
 
     async def convert_checkpoint_to_practice_with_mariam(
         self,
