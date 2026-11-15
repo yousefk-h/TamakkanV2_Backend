@@ -27,6 +27,23 @@ from app.services.topic_content_service import TopicContentService, get_topic_co
 MAX_DRAFT_ATTEMPTS = 2
 
 
+def _sanitize_exc_message(exc: Exception, *, max_len: int = 200) -> str:
+    """A short, safe-to-surface summary of a provider/schema exception.
+
+    Provider exceptions shouldn't normally contain the configured Gemini API
+    key, but this is defensive: redact it on sight before the message ever
+    reaches a raised exception or a log line, then bound the length.
+    """
+    message = str(exc)
+    api_key = get_settings().GEMINI_API_KEY
+    if api_key:
+        message = message.replace(api_key, "[REDACTED]")
+    message = message.strip()
+    if len(message) > max_len:
+        message = message[:max_len].rstrip() + "..."
+    return message
+
+
 class DraftExercisesRequest(BaseModel):
     kind: ExerciseKind
     count: int = Field(default=1, ge=1, le=5)
@@ -143,12 +160,19 @@ class ExerciseDraftService:
                 raise ServiceUnavailableException("AI exercise drafting is not configured in this development environment") from exc
             except ExerciseDraftingError as exc:
                 await fail_generation(claim, exc)
-                logger.warning("exercise_draft failure topic_id={} kind={} attempt={} latency_ms={:.0f} error={}",
-                               topic_id, body.kind.value, attempt, (time.perf_counter() - started) * 1000, type(exc).__name__)
+                sanitized_msg = _sanitize_exc_message(exc)
+                logger.warning(
+                    "exercise_draft failure topic_id={} kind={} attempt={} latency_ms={:.0f} error={} - {}",
+                    topic_id, body.kind.value, attempt, (time.perf_counter() - started) * 1000,
+                    type(exc).__name__, sanitized_msg,
+                )
                 if attempt < MAX_DRAFT_ATTEMPTS:
                     last_issues = [str(exc)]
                     continue
-                raise UpstreamServiceException("AI could not draft this skill. Try again or write it manually.") from exc
+                raise UpstreamServiceException(
+                    f"AI could not draft this skill: {type(exc).__name__} - {sanitized_msg}. "
+                    "Try again or write it manually."
+                ) from exc
         # Unreachable: the loop above always returns or raises.
         raise UpstreamServiceException("AI could not draft this skill. Try again or write it manually.")
 
