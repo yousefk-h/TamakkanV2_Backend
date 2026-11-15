@@ -10,7 +10,7 @@ from app.core.interactive_video_drafting import (
     get_interactive_video_drafter,
 )
 from app.models.ai_generation import AIGenerationType
-from app.models.topic_content import InteractiveVideoCheckpoint, InteractiveVideoTimelineSuggestion, LessonExercise, LessonFlow
+from app.models.topic_content import CheckpointKind, InteractiveVideoCheckpoint, InteractiveVideoTimelineSuggestion, LessonExercise, LessonFlow
 from app.models.user import User
 from app.schema.topic import LessonExerciseIn
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
@@ -65,6 +65,40 @@ class InteractiveVideoDraftService:
             accepted = list(topic.interactive_video_checkpoints)
             draft_exercises: list[LessonExercise] = []
             for proposal in proposed:
+                if proposal.checkpoint_kind == "practice_with_mariam":
+                    conversation_goal = (proposal.conversation_goal or "").strip()
+                    opening_line = (proposal.opening_line or "").strip()
+                    if not conversation_goal or not opening_line:
+                        continue
+                    duration = proposal.session_duration_minutes or 2
+                    duration = max(1, min(10, duration))
+                    candidate = InteractiveVideoCheckpoint(
+                        timestamp_seconds=proposal.timestamp_seconds,
+                        kind=CheckpointKind.PRACTICE_WITH_MARIAM,
+                        exercise_index=None,
+                        learning_objective=proposal.learning_goal.strip(),
+                        conversation_goal=conversation_goal,
+                        opening_line=opening_line,
+                        session_duration_minutes=duration,
+                    )
+                    try:
+                        validate_interactive_video_timeline(
+                            sorted([*accepted, candidate], key=lambda item: item.timestamp_seconds),
+                            [*topic.lesson_exercises, *draft_exercises],
+                            duration_seconds=max_time,
+                        )
+                    except UnprocessableException:
+                        continue
+                    accepted.append(candidate)
+                    drafts.append(InteractiveVideoTimelineSuggestion(
+                        **candidate.model_dump(exclude={"kind"}), checkpoint_kind=CheckpointKind.PRACTICE_WITH_MARIAM,
+                        rationale=proposal.rationale.strip(), exercise=None,
+                        learning_action=proposal.learning_action,
+                        learning_goal=proposal.learning_goal.strip(),
+                        source_evidence=proposal.source_evidence.strip(),
+                    ))
+                    continue
+
                 if _is_literal_recall(proposal):
                     continue
                 exercise_index = proposal.exercise_index

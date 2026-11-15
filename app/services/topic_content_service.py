@@ -23,7 +23,7 @@ from app.core.pdf_extraction import PdfExtractionError, extract_pdf_text
 from app.core.storage import DocumentStorage, ImageStorage, UploadFailedError, get_document_storage, get_image_storage, get_lesson_audio_storage
 from app.core.youtube import fetch_video_duration_seconds
 from app.models.topic_content import (
-    InteractiveVideoCheckpoint, LessonFlow, LearningObjective, SourceDocument,
+    CheckpointKind, InteractiveVideoCheckpoint, LessonFlow, LearningObjective, SourceDocument,
     SourceDocumentKind, TopicContent, TranscriptState,
 )
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
@@ -400,22 +400,34 @@ class TopicContentService:
             raise NotFoundException("No such timeline suggestion")
         selected = topic.interactive_video_drafts[index]
         exercises = list(topic.lesson_exercises)
-        if selected.exercise is not None:
-            # A new AI activity is still only a teacher draft until this
-            # explicit acceptance.  Append it and point this one checkpoint
-            # at the stable new index; the teacher can edit it in Studio
-            # before publishing.
-            exercises.append(selected.exercise)
-            exercise_index = len(exercises) - 1
-        elif selected.exercise_index is not None:
-            exercise_index = selected.exercise_index
+        if selected.checkpoint_kind == CheckpointKind.PRACTICE_WITH_MARIAM:
+            new_checkpoint = InteractiveVideoCheckpoint(
+                timestamp_seconds=selected.timestamp_seconds,
+                kind=CheckpointKind.PRACTICE_WITH_MARIAM,
+                exercise_index=None,
+                learning_objective=selected.learning_objective,
+                conversation_goal=selected.conversation_goal,
+                opening_line=selected.opening_line,
+                session_duration_minutes=selected.session_duration_minutes or 2,
+            )
         else:
-            raise UnprocessableException("This timeline suggestion has no usable activity")
-        checkpoints = [*topic.interactive_video_checkpoints, InteractiveVideoCheckpoint(
-            timestamp_seconds=selected.timestamp_seconds,
-            exercise_index=exercise_index,
-            completion_rule=selected.completion_rule,
-        )]
+            if selected.exercise is not None:
+                # A new AI activity is still only a teacher draft until this
+                # explicit acceptance.  Append it and point this one checkpoint
+                # at the stable new index; the teacher can edit it in Studio
+                # before publishing.
+                exercises.append(selected.exercise)
+                exercise_index = len(exercises) - 1
+            elif selected.exercise_index is not None:
+                exercise_index = selected.exercise_index
+            else:
+                raise UnprocessableException("This timeline suggestion has no usable activity")
+            new_checkpoint = InteractiveVideoCheckpoint(
+                timestamp_seconds=selected.timestamp_seconds,
+                exercise_index=exercise_index,
+                completion_rule=selected.completion_rule,
+            )
+        checkpoints = [*topic.interactive_video_checkpoints, new_checkpoint]
         checkpoints.sort(key=lambda item: item.timestamp_seconds)
         validate_interactive_video_timeline(checkpoints, exercises)
         drafts = [item.model_dump() for item_index, item in enumerate(topic.interactive_video_drafts) if item_index != index]
@@ -424,6 +436,51 @@ class TopicContentService:
             "lesson_exercises": [item.model_dump() for item in exercises],
             "interactive_video_checkpoints": [item.model_dump() for item in checkpoints],
             "interactive_video_drafts": drafts,
+            **revision,
+        })
+        return await self.get_one(topic_id)
+
+    async def convert_checkpoint_to_practice_with_mariam(
+        self,
+        topic_id: str,
+        checkpoint_id: str,
+        *,
+        learning_objective: Optional[str],
+        conversation_goal: str,
+        opening_line: str,
+        session_duration_minutes: int,
+        admin: User,
+    ) -> TopicContent:
+        """Teacher conversion of an existing (exercise-pointing or otherwise
+        suggested) checkpoint into a Practice with Mariam checkpoint, in
+        place - same timestamp, new kind. `exercise_index` is cleared; the
+        referenced lesson exercise itself (if any) is left untouched, just no
+        longer linked to this checkpoint."""
+        topic = await self.get_own_topic(topic_id, admin)
+        if topic.lesson_flow != LessonFlow.INTERACTIVE_VIDEO:
+            raise UnprocessableException("Choose Interactive Video before converting a checkpoint")
+        index = next((i for i, item in enumerate(topic.interactive_video_checkpoints) if item.id == checkpoint_id), None)
+        if index is None:
+            raise NotFoundException("No such video checkpoint")
+        existing = topic.interactive_video_checkpoints[index]
+        converted = InteractiveVideoCheckpoint(
+            id=existing.id,
+            timestamp_seconds=existing.timestamp_seconds,
+            kind=CheckpointKind.PRACTICE_WITH_MARIAM,
+            exercise_index=None,
+            learning_objective=learning_objective,
+            conversation_goal=conversation_goal,
+            opening_line=opening_line,
+            session_duration_minutes=session_duration_minutes,
+        )
+        checkpoints = list(topic.interactive_video_checkpoints)
+        checkpoints[index] = converted
+        validate_interactive_video_timeline(checkpoints, topic.lesson_exercises)
+        revision = await self._start_content_revision(topic)
+        await self.topic_repository.update_fields(topic_id, {
+            "interactive_video_checkpoints": [item.model_dump() for item in checkpoints],
+            "interactive_video_drafts": [],
+            "interactive_video_draft_generation_key": None,
             **revision,
         })
         return await self.get_one(topic_id)

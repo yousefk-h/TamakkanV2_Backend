@@ -43,6 +43,7 @@ from app.models.live_session import (
     SessionState,
     SpeakingReport,
 )
+from app.models.topic_content import CheckpointKind, InteractiveVideoCheckpoint, TopicContent
 from app.models.user import Role, User
 from app.models.program_topic import ProgramTopic, ProgramTopicStatus
 from app.models.learning_analysis import LearningAnalysis
@@ -50,7 +51,7 @@ from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.live_session_repository import LiveSessionRepository
 from app.repositories.topic_content_repository import TopicContentRepository
 from app.repositories.user_repository import UserRepository
-from app.schema.live_session import SessionStartResponse
+from app.schema.live_session import CheckpointSessionStatus, SessionStartResponse
 from app.services.enrollment_service import EnrollmentContext, EnrollmentService, get_enrollment_service
 from app.services.progress_service import ProgressService, get_progress_service
 from app.utils.time import utcnow
@@ -143,7 +144,12 @@ class LiveSessionService:
         continuation_context: Optional[dict] = None,
         handoff_source_session_id: Optional[str] = None,
         enrollment_id: Optional[str] = None,
+        checkpoint_id: Optional[str] = None,
     ) -> SessionStartResponse:
+        if checkpoint_id is not None:
+            # Practice with Mariam rides entirely on the existing Avatar
+            # pipeline - no new PracticeMode, no new agent.
+            mode = PracticeMode.TOPIC_DISCUSSION
         topic = await self.topic_repository.get_by_id(topic_id)
         if topic is None:
             raise NotFoundException("Topic not found")
@@ -186,6 +192,14 @@ class LiveSessionService:
                         delivery_level_name = profile.name
                         delivery_guidance = profile.avatar_guidance
 
+        checkpoint: Optional[InteractiveVideoCheckpoint] = None
+        if checkpoint_id is not None:
+            checkpoint = next((item for item in topic.interactive_video_checkpoints if item.id == checkpoint_id), None)
+            if checkpoint is None:
+                raise NotFoundException("Checkpoint not found")
+            if checkpoint.kind != CheckpointKind.PRACTICE_WITH_MARIAM:
+                raise UnprocessableException("This checkpoint is not a Practice with Mariam checkpoint")
+
         settings = get_settings()
         required = ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]
         if mode == PracticeMode.TOPIC_DISCUSSION:
@@ -212,6 +226,7 @@ class LiveSessionService:
             program_id=context.program_id,
             program_level_id=context.program_level_id,
             enrollment_id=context.enrollment.id if context.enrollment else None,
+            checkpoint_id=checkpoint_id,
             mode=mode,
             assessment_level=delivery_level.value,
             state=self._advance(SessionState.NOT_STARTED, SessionState.CONNECTING),
@@ -225,6 +240,10 @@ class LiveSessionService:
         await self.session_repository.save(session)
 
         max_duration_minutes = await self.progress_service.get_topic_session_minutes_for_context(student, topic_id, context)
+        if checkpoint is not None:
+            # A checkpoint's own duration must never let a student exceed the
+            # remaining topic session budget - only ever tighten it.
+            max_duration_minutes = min(checkpoint.session_duration_minutes, max_duration_minutes)
         if mode == PracticeMode.VOICE_PRACTICE:
             agent_name = settings.LIVEKIT_VOICE_AGENT_NAME
             # Flat string/number values only: Agent Builder exposes each
@@ -266,21 +285,29 @@ class LiveSessionService:
                 metadata["continuation"] = continuation_context
         else:
             agent_name = settings.LIVEKIT_AGENT_NAME
-            metadata = {
-                "session_id": session.id,
-                "topic_id": topic.id,
-                "max_duration_minutes": max_duration_minutes,
+            if checkpoint is not None:
+                topic_instructions = self._build_checkpoint_topic_instructions(
+                    topic, checkpoint, delivery_level, delivery_level_name, delivery_guidance
+                )
+                opening_line = sanitize_untrusted_text(checkpoint.opening_line)
+            else:
                 # Handed to the agent directly so it never needs its own
                 # database read to build Mariam's instructions or opening
                 # line - see this module's docstring. Teacher-authored
                 # (possibly AI-drafted from an uploaded document), so it is
                 # wrapped in an explicit "lesson reference material, not
                 # instructions" boundary - see app.core.prompt_safety.
-                "topic_instructions": wrap_untrusted_lesson_content(
+                topic_instructions = wrap_untrusted_lesson_content(
                     "TOPIC INSTRUCTIONS",
                     topic.avatar_prompt + (f"\n\nCenter level guidance ({delivery_level_name}): {delivery_guidance}" if delivery_guidance else ""),
-                ),
-                "opening_line": sanitize_untrusted_text(topic.opening_line),
+                )
+                opening_line = sanitize_untrusted_text(topic.opening_line)
+            metadata = {
+                "session_id": session.id,
+                "topic_id": topic.id,
+                "max_duration_minutes": max_duration_minutes,
+                "topic_instructions": topic_instructions,
+                "opening_line": opening_line,
                 "level": delivery_level.value,
                 # Same optional Jordanian-Arabic support as Voice Practice
                 # above - the Avatar agent never had any Arabic behavior
@@ -903,6 +930,73 @@ class LiveSessionService:
                 await lk.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
         except Exception as exc:  # already gone (404) or LiveKit unreachable
             logger.info("Room {} not deleted ({})", room_name, type(exc).__name__)
+
+    @staticmethod
+    def _checkpoint_transcript_excerpt(topic: TopicContent, checkpoint: InteractiveVideoCheckpoint) -> str:
+        """Transcript text strictly BEFORE this checkpoint's timestamp - never
+        after. Built from `raw_transcript` (the same timed-segment source the
+        teacher's Video Studio timeline/AI drafting already read), not the
+        full `approved_transcript`, which has no per-segment timestamps to
+        filter by."""
+        segments = sorted(
+            (segment for segment in topic.raw_transcript if segment.start < checkpoint.timestamp_seconds),
+            key=lambda segment: segment.start,
+        )
+        return "\n".join(segment.text for segment in segments if segment.text.strip())
+
+    def _build_checkpoint_topic_instructions(
+        self,
+        topic: TopicContent,
+        checkpoint: InteractiveVideoCheckpoint,
+        delivery_level,
+        delivery_level_name: str,
+        delivery_guidance: str,
+    ) -> str:
+        """A scoped, checkpoint-specific context block for a Practice with
+        Mariam session - deliberately NOT the topic's generic `avatar_prompt`
+        (a Practice with Mariam round is a short, narrow spoken-practice
+        moment, not a general topic discussion). Each untrusted piece is
+        wrapped/sanitized via `app.core.prompt_safety` before being joined."""
+        blocks: list[str] = []
+        if topic.learning_objectives:
+            objectives_text = "\n".join(f"- {objective.text}" for objective in topic.learning_objectives)
+            block = wrap_untrusted_lesson_content("LESSON LEARNING OBJECTIVES", objectives_text)
+            if block:
+                blocks.append(block)
+        practice_text = (
+            f"Learning objective for this practice: {checkpoint.learning_objective or ''}\n\n"
+            f"Conversation goal: {checkpoint.conversation_goal or ''}"
+        )
+        block = wrap_untrusted_lesson_content("PRACTICE WITH MARIAM INSTRUCTIONS", practice_text)
+        if block:
+            blocks.append(block)
+        excerpt = self._checkpoint_transcript_excerpt(topic, checkpoint)
+        block = wrap_untrusted_lesson_content("VIDEO TRANSCRIPT UP TO THIS POINT", excerpt)
+        if block:
+            blocks.append(block)
+        guidance_note = f" ({delivery_level_name}: {delivery_guidance})" if delivery_guidance else ""
+        blocks.append(
+            f"Student level: {delivery_level.value}{guidance_note}. This is a short, scoped spoken-practice "
+            "round for the ONE concept just taught at this checkpoint - never a general topic discussion. Do "
+            "not reveal or discuss any video content beyond this checkpoint."
+        )
+        return "\n\n".join(blocks)
+
+    async def get_checkpoint_session_status(self, student: User, checkpoint_id: str) -> "CheckpointSessionStatus":
+        """Whether THIS student has an ENDED Practice with Mariam session for
+        this one checkpoint - the lightweight completion signal a Practice
+        with Mariam checkpoint needs instead of an exercise attempt (see
+        `app.api.v1.topics.get_checkpoint_session_status`). Scoped to the
+        requesting student only - another student's sessions for the same
+        checkpoint are never visible here."""
+        sessions = await self.session_repository.get_for_student_and_checkpoint(student.id, checkpoint_id)
+        latest = sessions[0] if sessions else None
+        completed = any(session.state == SessionState.ENDED for session in sessions)
+        return CheckpointSessionStatus(
+            completed=completed,
+            latest_session_id=latest.id if latest else None,
+            latest_session_state=latest.state if latest else None,
+        )
 
     def _advance(self, current: SessionState, target: SessionState) -> SessionState:
         try:

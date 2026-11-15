@@ -41,8 +41,13 @@ async def start_session(
     entitlement rule as submitting a recording for it. `mode` selects Avatar
     Practice (Mariam, the default) or Voice Practice (the hosted voice agent).
     `enrollment_id` is required only when the student has more than one
-    active enrollment (422 otherwise naming the ambiguity)."""
-    return await service.start_session(student, body.topic_id, body.mode, enrollment_id=body.enrollment_id)
+    active enrollment (422 otherwise naming the ambiguity). `checkpoint_id`
+    starts this session for a specific Interactive Video Practice with
+    Mariam checkpoint instead of an ordinary Avatar Practice session -
+    see `LiveSessionService.start_session`."""
+    return await service.start_session(
+        student, body.topic_id, body.mode, enrollment_id=body.enrollment_id, checkpoint_id=body.checkpoint_id
+    )
 
 
 @router.post("/sessions/{session_id}/handoff", response_model=SessionStartResponse)

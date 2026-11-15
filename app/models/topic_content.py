@@ -246,13 +246,37 @@ class InteractiveVideoCompletionRule(str, Enum):
     CORRECT = "correct"
 
 
+class CheckpointKind(str, Enum):
+    """Discriminates what kind of pause a checkpoint is. Default `EXERCISE`
+    preserves every existing checkpoint's behavior/serialization -
+    `PRACTICE_WITH_MARIAM` is additive, see `InteractiveVideoCheckpoint`'s
+    own docstring for which fields apply to which kind."""
+
+    EXERCISE = "exercise"
+    PRACTICE_WITH_MARIAM = "practice_with_mariam"
+
+
 class InteractiveVideoCheckpoint(BaseModel):
-    """A pause point that references the exercise in this Topic revision."""
+    """A pause point in the video timeline. `kind=EXERCISE` (the default,
+    and every checkpoint that predates this field) references an answerable
+    exercise in this Topic revision via `exercise_index`, exactly as before.
+    `kind=PRACTICE_WITH_MARIAM` instead pauses for a short, scoped live
+    spoken-practice round with Mariam (the existing Avatar pipeline) - its
+    `exercise_index` MUST be `None`, and `learning_objective`/
+    `conversation_goal`/`opening_line` are specific to this one practice
+    moment (see `app.core.interactive_video.validate_interactive_video_timeline`
+    for the exact per-kind rules)."""
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     timestamp_seconds: float = Field(ge=0)
-    exercise_index: int = Field(ge=0)
+    kind: CheckpointKind = CheckpointKind.EXERCISE
+    exercise_index: Optional[int] = Field(default=None, ge=0)
     completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
+    # PRACTICE_WITH_MARIAM only - all optional/None for an EXERCISE checkpoint.
+    learning_objective: Optional[str] = None
+    conversation_goal: Optional[str] = None
+    opening_line: Optional[str] = None
+    session_duration_minutes: int = Field(default=2, ge=1, le=10)
 
 
 class InteractiveVideoTimelineSuggestion(BaseModel):
@@ -261,11 +285,14 @@ class InteractiveVideoTimelineSuggestion(BaseModel):
     Older proposals point at an already-authored exercise.  New proposals may
     carry a complete editable exercise draft instead, so the AI can recommend
     both a meaningful video moment and the suitable activity type without
-    publishing either one automatically.
+    publishing either one automatically. A proposal may instead suggest a
+    short Practice-with-Mariam spoken checkpoint (`checkpoint_kind`) - see
+    `InteractiveVideoCheckpoint`'s own docstring.
     """
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     timestamp_seconds: float = Field(ge=0)
+    checkpoint_kind: CheckpointKind = CheckpointKind.EXERCISE
     exercise_index: Optional[int] = Field(default=None, ge=0)
     completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
     rationale: str = Field(default="", max_length=500)
@@ -275,6 +302,11 @@ class InteractiveVideoTimelineSuggestion(BaseModel):
     learning_goal: str = Field(default="", max_length=280)
     source_evidence: str = Field(default="", max_length=500)
     exercise: Optional[LessonExercise] = None
+    # PRACTICE_WITH_MARIAM only.
+    learning_objective: Optional[str] = None
+    conversation_goal: Optional[str] = None
+    opening_line: Optional[str] = None
+    session_duration_minutes: Optional[int] = None
 
 
 class LessonDraftStepState(str, Enum):

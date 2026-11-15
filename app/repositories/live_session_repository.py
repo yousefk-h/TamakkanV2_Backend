@@ -19,6 +19,20 @@ class LiveSessionRepository(BaseRepository[LiveSession]):
             .to_list()
         )
 
+    async def get_for_student_and_checkpoint(self, student_id: str, checkpoint_id: str) -> list[LiveSession]:
+        """Every Practice with Mariam session this student opened for this
+        one checkpoint, newest first - see `LiveSessionService
+        .get_checkpoint_session_status`."""
+        return (
+            await LiveSession.find(
+                LiveSession.student_id == student_id,
+                LiveSession.checkpoint_id == checkpoint_id,
+                LiveSession.is_deleted == False,  # noqa: E712
+            )
+            .sort(-LiveSession.started_at)
+            .to_list()
+        )
+
     async def get_all_for_admin(self, student_ids: list[str]) -> list[LiveSession]:
         """`student_ids` is always the caller's own roster - same pattern as
         `RecordingSubmissionRepository.search`.

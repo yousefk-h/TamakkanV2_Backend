@@ -29,6 +29,7 @@ from pydantic import AfterValidator, BaseModel, Field, model_validator
 from app.core.youtube import derive_thumbnail_url, extract_video_id
 from app.models.topic_content import (
     ArabicInterventionLevel,
+    CheckpointKind,
     DialogueTurn,
     GuidedQuestionPart,
     ExerciseKind,
@@ -311,6 +312,7 @@ class InteractiveVideoTimelineUpdate(BaseModel):
 class InteractiveVideoTimelineSuggestionPublic(BaseModel):
     id: str
     timestamp_seconds: float
+    checkpoint_kind: CheckpointKind = CheckpointKind.EXERCISE
     exercise_index: Optional[int] = None
     completion_rule: str
     rationale: str = ""
@@ -318,16 +320,37 @@ class InteractiveVideoTimelineSuggestionPublic(BaseModel):
     learning_goal: str = ""
     source_evidence: str = ""
     exercise: Optional[LessonExerciseIn] = None
+    learning_objective: Optional[str] = None
+    conversation_goal: Optional[str] = None
+    opening_line: Optional[str] = None
+    session_duration_minutes: Optional[int] = None
 
     @classmethod
     def from_suggestion(cls, item: InteractiveVideoTimelineSuggestion) -> "InteractiveVideoTimelineSuggestionPublic":
         return cls(
             id=item.id, timestamp_seconds=item.timestamp_seconds,
+            checkpoint_kind=item.checkpoint_kind,
             exercise_index=item.exercise_index, completion_rule=item.completion_rule.value,
             rationale=item.rationale, exercise=item.exercise,
             learning_action=item.learning_action, learning_goal=item.learning_goal,
             source_evidence=item.source_evidence,
+            learning_objective=item.learning_objective,
+            conversation_goal=item.conversation_goal,
+            opening_line=item.opening_line,
+            session_duration_minutes=item.session_duration_minutes,
         )
+
+
+class ConvertCheckpointToPracticeWithMariamRequest(BaseModel):
+    """Body for `POST /topics/{topic_id}/interactive-video-timeline/
+    {checkpoint_id}/convert-to-practice` - converts an existing checkpoint
+    (whatever it currently points at) into a Practice with Mariam checkpoint
+    in place, at its existing timestamp."""
+
+    learning_objective: Optional[str] = Field(default=None, max_length=500)
+    conversation_goal: Annotated[str, Field(min_length=1, max_length=2000)]
+    opening_line: Annotated[str, Field(min_length=1, max_length=500)]
+    session_duration_minutes: int = Field(default=2, ge=1, le=10)
 
 
 class ApproveTranscriptRequest(BaseModel):

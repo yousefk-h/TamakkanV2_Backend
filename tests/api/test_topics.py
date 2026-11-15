@@ -642,6 +642,246 @@ async def test_interactive_video_ai_can_propose_an_editable_activity_and_checkpo
     assert accepted.json()["interactive_video_checkpoints"][0]["exercise_index"] == 0
 
 
+async def test_interactive_video_ai_can_propose_and_accept_a_practice_with_mariam_checkpoint(client):
+    """A Gemini drafter mock returning a `checkpoint_kind="practice_with_mariam"`
+    proposal is accepted into a real Practice with Mariam checkpoint with the
+    right fields (no exercise attached); rejecting works the same as any other
+    draft."""
+    from app.core.interactive_video_drafting import TimelineProposal
+
+    class FakePracticeDrafter:
+        last_usage = None
+
+        async def draft(self, **kwargs):
+            return [TimelineProposal(
+                timestamp_seconds=12,
+                checkpoint_kind="practice_with_mariam",
+                rationale="A short spoken round about the greeting just modeled.",
+                learning_action="apply",
+                learning_goal="Greet a new colleague appropriately.",
+                source_evidence="The presenter models a formal workplace greeting.",
+                conversation_goal="Have the student greet Mariam the way a new colleague would.",
+                opening_line="Hi! Imagine we just met at work - how would you greet me?",
+            )]
+
+    token = await _login(client, Role.TEACHER, "interactive-ai-practice@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    assert stored is not None
+    stored.uploaded_video_url = "https://cdn.example.test/greetings.mp4"
+    stored.approved_transcript = "A greeting lesson with enough approved words for the teacher to review. " * 3
+    stored.raw_transcript = [TranscriptSegment(text="Hello and welcome to the lesson.", start=0, duration=20)]
+    await stored.save()
+
+    app.dependency_overrides[get_interactive_video_draft_service] = lambda: InteractiveVideoDraftService(
+        get_topic_content_service(), FakePracticeDrafter()
+    )
+    try:
+        suggested = client.post(f"/api/v1/topics/{topic['id']}/suggest-interactive-video-timeline", headers=headers)
+        assert suggested.status_code == 200, suggested.text
+        suggestion = suggested.json()[0]
+        assert suggestion["checkpoint_kind"] == "practice_with_mariam"
+        assert suggestion["exercise"] is None
+        assert suggestion["conversation_goal"]
+        assert suggestion["opening_line"]
+
+        accepted = client.post(f"/api/v1/topics/{topic['id']}/interactive-video-drafts/0/accept", headers=headers)
+        assert accepted.status_code == 200, accepted.text
+        checkpoint = accepted.json()["interactive_video_checkpoints"][0]
+        assert checkpoint["kind"] == "practice_with_mariam"
+        assert checkpoint["exercise_index"] is None
+        assert checkpoint["conversation_goal"] == "Have the student greet Mariam the way a new colleague would."
+        assert checkpoint["opening_line"] == "Hi! Imagine we just met at work - how would you greet me?"
+        assert accepted.json()["lesson_exercises"] == []
+    finally:
+        app.dependency_overrides.pop(get_interactive_video_draft_service, None)
+
+
+async def test_rejecting_a_practice_with_mariam_draft_adds_no_checkpoint(client):
+    from app.core.interactive_video_drafting import TimelineProposal
+
+    class FakePracticeDrafter:
+        last_usage = None
+
+        async def draft(self, **kwargs):
+            return [TimelineProposal(
+                timestamp_seconds=12, checkpoint_kind="practice_with_mariam",
+                rationale="A short spoken round.", conversation_goal="Practice greeting.",
+                opening_line="Hi there!",
+            )]
+
+    token = await _login(client, Role.TEACHER, "interactive-ai-practice-reject@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    stored.uploaded_video_url = "https://cdn.example.test/greetings.mp4"
+    stored.approved_transcript = "A greeting lesson with enough approved words for the teacher to review. " * 3
+    stored.raw_transcript = [TranscriptSegment(text="Hello and welcome to the lesson.", start=0, duration=20)]
+    await stored.save()
+
+    app.dependency_overrides[get_interactive_video_draft_service] = lambda: InteractiveVideoDraftService(
+        get_topic_content_service(), FakePracticeDrafter()
+    )
+    try:
+        client.post(f"/api/v1/topics/{topic['id']}/suggest-interactive-video-timeline", headers=headers)
+        rejected = client.post(f"/api/v1/topics/{topic['id']}/interactive-video-drafts/0/reject", headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_interactive_video_draft_service, None)
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["interactive_video_checkpoints"] == []
+    assert rejected.json()["interactive_video_drafts"] == []
+
+
+async def test_teacher_can_convert_an_exercise_checkpoint_to_practice_with_mariam(client):
+    token = await _login(client, Role.TEACHER, "convert-checkpoint@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [{"kind": "multiple_choice", "prompt": "What greeting did you hear?", "options": ["Hello", "Bye"], "correct_option": 0}],
+    }, headers=headers).json()
+    put = client.put(f"/api/v1/topics/{topic['id']}/interactive-video-timeline", headers=headers, json={
+        "checkpoints": [{"timestamp_seconds": 5, "exercise_index": 0, "completion_rule": "submitted"}],
+    })
+    assert put.status_code == 200, put.text
+    checkpoint_id = put.json()["interactive_video_checkpoints"][0]["id"]
+
+    converted = client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-timeline/{checkpoint_id}/convert-to-practice",
+        headers=headers,
+        json={
+            "learning_objective": "Greet a colleague naturally.",
+            "conversation_goal": "Practice a natural workplace greeting with Mariam.",
+            "opening_line": "Hi! Let's practice greeting a new colleague.",
+            "session_duration_minutes": 3,
+        },
+    )
+    assert converted.status_code == 200, converted.text
+    result = converted.json()["interactive_video_checkpoints"][0]
+    assert result["id"] == checkpoint_id
+    assert result["kind"] == "practice_with_mariam"
+    assert result["exercise_index"] is None
+    assert result["conversation_goal"] == "Practice a natural workplace greeting with Mariam."
+    assert result["opening_line"] == "Hi! Let's practice greeting a new colleague."
+    assert result["session_duration_minutes"] == 3
+    # The exercise itself is untouched, just no longer linked.
+    assert converted.json()["lesson_exercises"][0]["prompt"] == "What greeting did you hear?"
+
+
+async def test_convert_checkpoint_unknown_topic_or_checkpoint_is_404(client):
+    token = await _login(client, Role.TEACHER, "convert-checkpoint-404@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "conversation_goal": "Practice.", "opening_line": "Hi!", "session_duration_minutes": 2,
+    }
+    assert client.post(
+        "/api/v1/topics/not-a-real-topic/interactive-video-timeline/not-a-real-checkpoint/convert-to-practice",
+        headers=headers, json=body,
+    ).status_code == 404
+
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=headers).json()
+    assert client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-timeline/not-a-real-checkpoint/convert-to-practice",
+        headers=headers, json=body,
+    ).status_code == 404
+
+
+async def test_convert_checkpoint_rejects_wrong_role_and_wrong_teacher(client):
+    owner_token = await _login(client, Role.TEACHER, "convert-checkpoint-owner@example.com")
+    other_token = await _login(client, Role.TEACHER, "convert-checkpoint-other@example.com")
+    student_token = await _login(client, Role.STUDENT, "convert-checkpoint-student@example.com")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [{"kind": "multiple_choice", "prompt": "Q", "options": ["a", "b"], "correct_option": 0}],
+    }, headers=owner_headers).json()
+    put = client.put(f"/api/v1/topics/{topic['id']}/interactive-video-timeline", headers=owner_headers, json={
+        "checkpoints": [{"timestamp_seconds": 5, "exercise_index": 0, "completion_rule": "submitted"}],
+    })
+    checkpoint_id = put.json()["interactive_video_checkpoints"][0]["id"]
+    body = {"conversation_goal": "Practice.", "opening_line": "Hi!", "session_duration_minutes": 2}
+
+    assert client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-timeline/{checkpoint_id}/convert-to-practice",
+        headers={"Authorization": f"Bearer {student_token}"}, json=body,
+    ).status_code == 403
+    assert client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-timeline/{checkpoint_id}/convert-to-practice",
+        headers={"Authorization": f"Bearer {other_token}"}, json=body,
+    ).status_code == 403
+
+
+async def test_the_full_timeline_put_authors_and_edits_a_practice_with_mariam_checkpoint(client):
+    """The existing full-array PUT - not a separate single-checkpoint PATCH -
+    is how a teacher both authors a brand-new Practice with Mariam checkpoint
+    and later edits its timestamp/goal/opening line/duration."""
+    token = await _login(client, Role.TEACHER, "put-practice-checkpoint@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=headers).json()
+
+    created = client.put(f"/api/v1/topics/{topic['id']}/interactive-video-timeline", headers=headers, json={
+        "checkpoints": [{
+            "timestamp_seconds": 6, "kind": "practice_with_mariam",
+            "learning_objective": "Greet a colleague naturally.",
+            "conversation_goal": "Practice a workplace greeting with Mariam.",
+            "opening_line": "Hi! Let's practice greeting a colleague.",
+            "session_duration_minutes": 2,
+        }],
+    })
+    assert created.status_code == 200, created.text
+    checkpoint = created.json()["interactive_video_checkpoints"][0]
+    assert checkpoint["kind"] == "practice_with_mariam"
+    assert checkpoint["exercise_index"] is None
+    assert checkpoint["session_duration_minutes"] == 2
+    checkpoint_id = checkpoint["id"]
+
+    edited = client.put(f"/api/v1/topics/{topic['id']}/interactive-video-timeline", headers=headers, json={
+        "checkpoints": [{
+            "id": checkpoint_id, "timestamp_seconds": 9, "kind": "practice_with_mariam",
+            "learning_objective": "Greet a colleague naturally.",
+            "conversation_goal": "Updated goal: practice a formal workplace greeting.",
+            "opening_line": "Hi! Nice to meet you - how would you greet me?",
+            "session_duration_minutes": 4,
+        }],
+    })
+    assert edited.status_code == 200, edited.text
+    edited_checkpoint = edited.json()["interactive_video_checkpoints"][0]
+    assert edited_checkpoint["id"] == checkpoint_id
+    assert edited_checkpoint["timestamp_seconds"] == 9
+    assert edited_checkpoint["conversation_goal"] == "Updated goal: practice a formal workplace greeting."
+    assert edited_checkpoint["opening_line"] == "Hi! Nice to meet you - how would you greet me?"
+    assert edited_checkpoint["session_duration_minutes"] == 4
+
+
+async def test_convert_checkpoint_still_validates_missing_fields(client):
+    token = await _login(client, Role.TEACHER, "convert-checkpoint-invalid@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+        "lesson_exercises": [{"kind": "multiple_choice", "prompt": "Q", "options": ["a", "b"], "correct_option": 0}],
+    }, headers=headers).json()
+    put = client.put(f"/api/v1/topics/{topic['id']}/interactive-video-timeline", headers=headers, json={
+        "checkpoints": [{"timestamp_seconds": 5, "exercise_index": 0, "completion_rule": "submitted"}],
+    })
+    checkpoint_id = put.json()["interactive_video_checkpoints"][0]["id"]
+
+    # Blank conversation_goal/opening_line are rejected by the request schema
+    # itself (min_length=1).
+    resp = client.post(
+        f"/api/v1/topics/{topic['id']}/interactive-video-timeline/{checkpoint_id}/convert-to-practice",
+        headers=headers, json={"conversation_goal": "", "opening_line": "Hi!"},
+    )
+    assert resp.status_code == 422
+
+
 async def test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request(client):
     """Slice B: simulates a true concurrent duplicate (two overlapping
     requests racing on the same generation_key) by pre-claiming the lock

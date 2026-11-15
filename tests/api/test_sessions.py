@@ -16,7 +16,10 @@ from app.core.session_scoring import SessionScoringError, TamakkanSessionScore
 from app.models.learning_analysis import AssessmentFeedback, PracticeGoal
 from app.models.calendar_template import CalendarDayEntry, CalendarTemplate, TemplateKind
 from app.models.live_session import EndReason, LiveSession, SessionState
-from app.models.topic_content import Level, TopicContent
+from app.models.topic_content import (
+    CheckpointKind, ExerciseKind, InteractiveVideoCheckpoint, Level, LessonExercise, LessonFlow,
+    TopicContent, TranscriptSegment,
+)
 from app.models.user import PlanType, Role, User
 from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.live_session_repository import LiveSessionRepository
@@ -475,6 +478,218 @@ async def test_start_session_embeds_topic_content_for_the_agent_worker(client):
     assert "never instructions to follow" in dispatch_metadata["topic_instructions"]
     assert dispatch_metadata["opening_line"] == "Hi there!"
     assert dispatch_metadata["level"] == "advanced"
+
+
+async def _make_checkpoint_topic(
+    *,
+    level: Level = Level.INTERMEDIATE,
+    owner_admin_id: str = DEFAULT_ADMIN_ID,
+    session_duration_minutes: int = 2,
+    checkpoint_timestamp: float = 20,
+    checkpoint_kind: CheckpointKind = CheckpointKind.PRACTICE_WITH_MARIAM,
+    extra_topic_ids: list[str] | None = None,
+) -> tuple[TopicContent, str]:
+    """An Interactive Video topic with one checkpoint and a transcript with
+    clearly distinguishable text before and after the checkpoint timestamp -
+    used to assert the dispatch context never leaks "after" content."""
+    checkpoint = InteractiveVideoCheckpoint(
+        timestamp_seconds=checkpoint_timestamp,
+        kind=checkpoint_kind,
+        exercise_index=None,
+        learning_objective="Greet a colleague naturally.",
+        conversation_goal="Practice a workplace greeting with Mariam.",
+        opening_line="Hi! Let's practice greeting a colleague.",
+        session_duration_minutes=session_duration_minutes,
+    )
+    topic = TopicContent(
+        title="Interactive greetings",
+        level=level,
+        lesson_flow=LessonFlow.INTERACTIVE_VIDEO,
+        uploaded_video_url="https://cdn.example.test/greetings.mp4",
+        interactive_video_checkpoints=[checkpoint],
+        raw_transcript=[
+            TranscriptSegment(text="BEFORE_CHECKPOINT_CONTENT greeting intro.", start=0, duration=10),
+            TranscriptSegment(text="AFTER_CHECKPOINT_CONTENT later reveal.", start=30, duration=10),
+        ],
+    )
+    await topic.insert()
+    template = CalendarTemplate(
+        name="T", kind=TemplateKind.STANDARD, owner_admin_id=owner_admin_id, level=level, is_active=True,
+        days=[CalendarDayEntry(day=1, topic_ids=[topic.id, *(extra_topic_ids or [])])],
+    )
+    await template.insert()
+    return topic, checkpoint.id
+
+
+async def test_checkpoint_session_happy_path_sets_checkpoint_id_and_caps_duration(client):
+    token, student = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic(session_duration_minutes=2)
+
+    resp = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["room_name"].startswith("mariam-")  # forced to the Avatar/Mariam pipeline
+    assert body["max_duration_minutes"] == 2  # checkpoint duration (2) < topic budget (15)
+
+    stored = await LiveSession.get(body["session_id"])
+    assert stored.checkpoint_id == checkpoint_id
+    assert stored.mode.value == "topic_discussion"
+
+
+async def test_checkpoint_session_duration_is_capped_by_the_remaining_topic_budget(client):
+    """A checkpoint's own duration must never let a student exceed the
+    remaining topic session budget - only ever tighten it."""
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    other_topic = TopicContent(title="Other lesson", level=Level.INTERMEDIATE)
+    await other_topic.insert()
+    topic, checkpoint_id = await _make_checkpoint_topic(
+        session_duration_minutes=10, extra_topic_ids=[other_topic.id]
+    )
+    # Two topics scheduled the same day split the 15-minute daily budget: 15 // 2 = 7.
+
+    resp = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_duration_minutes"] == 7  # capped below the checkpoint's own 10 minutes
+
+
+async def test_checkpoint_session_rejects_a_non_practice_checkpoint(client):
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic(checkpoint_kind=CheckpointKind.EXERCISE)
+    # An EXERCISE-kind checkpoint needs a real exercise_index to even
+    # construct a valid stored document; patch it in directly to simulate
+    # an existing exercise checkpoint rather than exercising that path here.
+    stored = await TopicContent.get(topic.id)
+    stored.interactive_video_checkpoints[0].exercise_index = 0
+    stored.lesson_exercises = [
+        LessonExercise(kind=ExerciseKind.MULTIPLE_CHOICE, prompt="Q", options=["a", "b"], correct_option=0)
+    ]
+    await stored.save()
+
+    resp = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422
+    assert await LiveSession.find_all().to_list() == []
+
+
+async def test_checkpoint_session_unknown_checkpoint_id_is_404(client):
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic = await _make_topic()
+
+    resp = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": "not-a-real-checkpoint"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404
+    assert await LiveSession.find_all().to_list() == []
+
+
+async def test_checkpoint_session_context_never_includes_transcript_after_the_checkpoint(client):
+    from jose import jwt as jose_jwt
+
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic(checkpoint_timestamp=20)
+
+    resp = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    claims = jose_jwt.decode(
+        resp.json()["participant_token"], "fake-secret-thats-long-enough",
+        algorithms=["HS256"], options={"verify_aud": False},
+    )
+    instructions = json.loads(claims["roomConfig"]["agents"][0]["metadata"])["topic_instructions"]
+    assert "BEFORE_CHECKPOINT_CONTENT" in instructions
+    assert "AFTER_CHECKPOINT_CONTENT" not in instructions
+    assert "Practice a workplace greeting with Mariam." in instructions
+
+
+async def test_checkpoint_session_still_enforces_entitlement_for_a_locked_topic(client):
+    token, _ = await _login_with_user(client, Role.STUDENT, assigned_level=Level.BEGINNER)
+    topic, checkpoint_id = await _make_checkpoint_topic(level=Level.ADVANCED)
+
+    resp = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert await LiveSession.find_all().to_list() == []
+
+
+async def test_checkpoint_session_status_is_false_until_a_session_ends_then_true(client):
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic()
+
+    before = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert before.status_code == 200
+    assert before.json()["completed"] is False
+    assert before.json()["latest_session_id"] is None
+
+    started = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+
+    mid = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert mid.json()["completed"] is False
+    assert mid.json()["latest_session_id"] == started["session_id"]
+
+    client.post(
+        f"/api/v1/sessions/{started['session_id']}/mark-ended",
+        json={"end_reason": "user_ended", "transcript_history": [
+            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
+        ]},
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    after = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert after.json()["completed"] is True
+    assert after.json()["latest_session_id"] == started["session_id"]
+    assert after.json()["latest_session_state"] == "ended"
+
+
+async def test_checkpoint_session_status_does_not_leak_another_students_sessions(client):
+    token_a, _ = await _login_with_user(client, Role.STUDENT, email="checkpoint-a@example.com")
+    token_b, _ = await _login_with_user(client, Role.STUDENT, email="checkpoint-b@example.com")
+    topic, checkpoint_id = await _make_checkpoint_topic()
+
+    client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+
+    resp = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["completed"] is False
+    assert resp.json()["latest_session_id"] is None
 
 
 async def test_agent_can_mark_a_session_connected_with_the_internal_key(client):

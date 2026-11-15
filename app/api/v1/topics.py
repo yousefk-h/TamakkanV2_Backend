@@ -22,7 +22,7 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 
-from app.core.security import get_current_user, require_teacher_or_administrator
+from app.core.security import get_current_user, require_role, require_teacher_or_administrator
 from app.core.storage import UploadFailedError, get_image_storage, get_lesson_audio_storage
 from app.core.exceptions import UnprocessableException
 from app.core.transcript_english_review import TranscriptReviewResult
@@ -40,6 +40,7 @@ from app.schema.topic import (
     ObjectiveSuggestionPublic,
     InteractiveVideoTimelineUpdate,
     InteractiveVideoTimelineSuggestionPublic,
+    ConvertCheckpointToPracticeWithMariamRequest,
     TextSourceCreate,
     SourceVideoFinalize,
     SourceVideoUploadRequest,
@@ -47,6 +48,7 @@ from app.schema.topic import (
     TranscriptSegmentsUpdate,
     resolve_thumbnail_url,
 )
+from app.schema.live_session import CheckpointSessionStatus
 from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.services.topic_content_service import (
     MAX_PDF_UPLOAD_BYTES,
@@ -69,6 +71,7 @@ from app.services.exercise_draft_service import DraftExercisesRequest, DraftExer
 from app.services.lesson_draft_service import LessonDraftService, get_lesson_draft_service
 from app.services.objective_draft_service import ObjectiveDraftService, get_objective_draft_service
 from app.services.interactive_video_draft_service import InteractiveVideoDraftService, get_interactive_video_draft_service
+from app.services.live_session_service import LiveSessionService, get_live_session_service
 
 router = APIRouter()
 
@@ -263,6 +266,50 @@ async def reject_interactive_video_suggestion(
     service: TopicContentService = Depends(get_topic_content_service),
 ) -> TopicPublic:
     return TopicPublic.from_topic(await service.reject_interactive_video_draft(topic_id, index, teacher), include_internal=True)
+
+
+@router.post(
+    "/topics/{topic_id}/interactive-video-timeline/{checkpoint_id}/convert-to-practice",
+    response_model=TopicPublic,
+)
+async def convert_checkpoint_to_practice_with_mariam(
+    topic_id: str,
+    checkpoint_id: str,
+    body: ConvertCheckpointToPracticeWithMariamRequest,
+    teacher: User = Depends(require_teacher_or_administrator),
+    service: TopicContentService = Depends(get_topic_content_service),
+) -> TopicPublic:
+    """Teacher-only. Converts an existing checkpoint (whatever activity it
+    currently points at, or an unaccepted suggestion once accepted) into a
+    Practice with Mariam checkpoint in place, at its existing timestamp."""
+    topic = await service.convert_checkpoint_to_practice_with_mariam(
+        topic_id,
+        checkpoint_id,
+        learning_objective=body.learning_objective,
+        conversation_goal=body.conversation_goal,
+        opening_line=body.opening_line,
+        session_duration_minutes=body.session_duration_minutes,
+        admin=teacher,
+    )
+    return TopicPublic.from_topic(topic, include_internal=True)
+
+
+@router.get(
+    "/topics/{topic_id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+    response_model=CheckpointSessionStatus,
+)
+async def get_checkpoint_session_status(
+    topic_id: str,
+    checkpoint_id: str,
+    student: User = Depends(require_role(Role.STUDENT)),
+    service: LiveSessionService = Depends(get_live_session_service),
+) -> CheckpointSessionStatus:
+    """Student only. Whether the requesting student has an ENDED Practice
+    with Mariam session for this checkpoint - scoped to that student only.
+    `topic_id` is accepted for a stable, resource-scoped URL; the lookup
+    itself is keyed on `checkpoint_id` (globally unique) and the requester.
+    """
+    return await service.get_checkpoint_session_status(student, checkpoint_id)
 
 
 @router.put("/topics/{topic_id}/objectives", response_model=TopicPublic)

@@ -116,6 +116,14 @@ class LiveSession(BaseDocument):
     # program_id/program_level_id (e.g. two Cohorts of one Program) still
     # keep independent progress/session history.
     enrollment_id: Annotated[Optional[str], Indexed()] = None
+    # Set only when this Avatar session was started FOR a specific Interactive
+    # Video "Practice with Mariam" checkpoint (see `LiveSessionService
+    # .start_session`'s `checkpoint_id` kwarg) - `None` for every ordinary
+    # Avatar Practice / Voice Practice session, including every pre-existing
+    # record. Lets a checkpoint's own completion be read back later without
+    # re-deriving it from exercise attempts, which don't apply to this kind
+    # of checkpoint - see `LiveSessionService.get_checkpoint_session_status`.
+    checkpoint_id: Annotated[Optional[str], Indexed()] = None
     livekit_room_name: str = ""
     mode: PracticeMode = PracticeMode.TOPIC_DISCUSSION
     # Snapshot the level for later comparisons even if the lesson is edited.

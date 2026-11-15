@@ -15,11 +15,17 @@ MAX_BROWSER_TRANSCRIPT_TURNS = 600
 class SessionStartRequest(BaseModel):
     topic_id: str
     # Only picks WHICH agent to talk to. Prompt, level and every other lesson
-    # setting are always read server-side from the saved lesson.
+    # setting are always read server-side from the saved lesson. Ignored
+    # (forced to TOPIC_DISCUSSION) when `checkpoint_id` is given.
     mode: PracticeMode = PracticeMode.TOPIC_DISCUSSION
     # Required only when the student has more than one active Enrollment -
     # see `EnrollmentService.resolve_context`. Omitted otherwise.
     enrollment_id: Optional[str] = None
+    # Starts this session FOR a specific Interactive Video "Practice with
+    # Mariam" checkpoint instead of an ordinary Avatar Practice session -
+    # see `LiveSessionService.start_session`'s `checkpoint_id` kwarg. Omitted
+    # for every ordinary Avatar/Voice Practice session start, unchanged.
+    checkpoint_id: Optional[str] = None
 
 
 class BrowserTranscriptTurn(BaseModel):
@@ -185,3 +191,14 @@ class SessionPage(BaseModel):
     total: int
     page: int
     limit: int
+
+
+class CheckpointSessionStatus(BaseModel):
+    """Response for `GET /topics/{topic_id}/interactive-video-checkpoints/
+    {checkpoint_id}/session-status` - a Practice with Mariam checkpoint's
+    lightweight completion signal (no exercise attempt applies to this kind
+    of checkpoint). Scoped to the requesting student only."""
+
+    completed: bool
+    latest_session_id: Optional[str] = None
+    latest_session_state: Optional[SessionState] = None
