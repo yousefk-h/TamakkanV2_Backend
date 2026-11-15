@@ -4,9 +4,9 @@ The provider returns structured data, never writes a topic. A teacher decides
 which suggestions to keep, edits them, then uses the normal topic PATCH.
 """
 
-from typing import Protocol
+from typing import Any, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.providers.google import GoogleProvider
@@ -56,7 +56,21 @@ vocabulary drafting path. This is a draft, not content approved for students."""
 
 
 class DraftExerciseOutput(BaseModel):
-    exercises: list[LessonExerciseIn] = Field(min_length=1, max_length=5)
+    """The small provider-facing contract for exercise generation.
+
+    ``LessonExerciseIn`` is deliberately *not* used as Gemini's structured
+    output schema.  It includes every field for every one of our fifteen
+    exercise types (including nested dialogue and matching-pair models),
+    which makes a provider schema much larger and more recursive than the
+    task requires.  Keeping this boundary small prevents provider-side schema
+    compatibility from blocking an otherwise valid exercise request.
+
+    We still validate every returned item against ``LessonExerciseIn`` below,
+    before it leaves this module.  This only makes the wire contract simpler;
+    it does not loosen teacher-facing validation or persistence rules.
+    """
+
+    exercises: list[dict[str, Any]] = Field(min_length=1, max_length=5)
 
 
 class ExerciseDraftingError(Exception):
@@ -102,7 +116,13 @@ class GeminiExerciseDrafter:
         except Exception as exc:
             raise ExerciseDraftingError(str(exc)) from exc
         self.last_usage = result.usage
-        return result.output.exercises
+        try:
+            return [LessonExerciseIn.model_validate(item) for item in result.output.exercises]
+        except ValidationError as exc:
+            # Keep provider output out of the public API and generation log;
+            # it can contain teacher source material.  The service converts
+            # this to its existing safe, teacher-actionable response.
+            raise ExerciseDraftingError("Provider returned an invalid exercise draft") from exc
 
 
 def get_exercise_drafter() -> ExerciseDrafter:
