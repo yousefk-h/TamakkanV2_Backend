@@ -583,6 +583,55 @@ async def test_interactive_video_checkpoint_suggestions_stay_private_until_accep
     assert accepted.json()["interactive_video_drafts"] == []
 
 
+async def test_interactive_video_ai_can_propose_an_editable_activity_and_checkpoint(client):
+    """The teacher need not author every question before asking AI where it
+    belongs.  The proposal stays private; accepting it creates a normal
+    editable exercise plus its one linked checkpoint."""
+    from app.core.interactive_video_drafting import TimelineProposal
+
+    class FakeTimelineDrafter:
+        last_usage = None
+
+        async def draft(self, **kwargs):
+            assert "[10.0s-30.0s]" in kwargs["timestamped_source"]
+            return [TimelineProposal(
+                timestamp_seconds=18,
+                completion_rule="submitted",
+                rationale="The speaker models the target greeting here.",
+                exercise={
+                    "kind": "writing", "prompt": "Write one greeting you could use at work.",
+                    "min_words": 5,
+                },
+            )]
+
+    token = await _login(client, Role.TEACHER, "interactive-ai-new-activity@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    topic = client.post("/api/v1/topics", json={
+        "title": "Video greetings", "level": "beginner", "lesson_flow": "interactive_video",
+    }, headers=headers).json()
+    stored = await TopicContent.get(topic["id"])
+    assert stored is not None
+    stored.uploaded_video_url = "https://cdn.example.test/greetings.mp4"
+    stored.approved_transcript = "A greeting lesson with enough approved words for the teacher to review. " * 3
+    stored.raw_transcript = [TranscriptSegment(text="Hello and welcome to the lesson.", start=10, duration=20)]
+    await stored.save()
+
+    app.dependency_overrides[get_interactive_video_draft_service] = lambda: InteractiveVideoDraftService(
+        get_topic_content_service(), FakeTimelineDrafter()
+    )
+    try:
+        suggested = client.post(f"/api/v1/topics/{topic['id']}/suggest-interactive-video-timeline", headers=headers)
+        assert suggested.status_code == 200, suggested.text
+        assert suggested.json()[0]["exercise"]["kind"] == "writing"
+        assert client.get(f"/api/v1/topics/{topic['id']}", headers=headers).json()["lesson_exercises"] == []
+        accepted = client.post(f"/api/v1/topics/{topic['id']}/interactive-video-drafts/0/accept", headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_interactive_video_draft_service, None)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["lesson_exercises"][0]["prompt"] == "Write one greeting you could use at work."
+    assert accepted.json()["interactive_video_checkpoints"][0]["exercise_index"] == 0
+
+
 async def test_exercise_draft_rejects_a_genuinely_concurrent_duplicate_request(client):
     """Slice B: simulates a true concurrent duplicate (two overlapping
     requests racing on the same generation_key) by pre-claiming the lock

@@ -393,12 +393,29 @@ class TopicContentService:
         if index < 0 or index >= len(topic.interactive_video_drafts):
             raise NotFoundException("No such timeline suggestion")
         selected = topic.interactive_video_drafts[index]
-        checkpoints = [*topic.interactive_video_checkpoints, InteractiveVideoCheckpoint(**selected.model_dump(exclude={"rationale"}))]
+        exercises = list(topic.lesson_exercises)
+        if selected.exercise is not None:
+            # A new AI activity is still only a teacher draft until this
+            # explicit acceptance.  Append it and point this one checkpoint
+            # at the stable new index; the teacher can edit it in Studio
+            # before publishing.
+            exercises.append(selected.exercise)
+            exercise_index = len(exercises) - 1
+        elif selected.exercise_index is not None:
+            exercise_index = selected.exercise_index
+        else:
+            raise UnprocessableException("This timeline suggestion has no usable activity")
+        checkpoints = [*topic.interactive_video_checkpoints, InteractiveVideoCheckpoint(
+            timestamp_seconds=selected.timestamp_seconds,
+            exercise_index=exercise_index,
+            completion_rule=selected.completion_rule,
+        )]
         checkpoints.sort(key=lambda item: item.timestamp_seconds)
-        validate_interactive_video_timeline(checkpoints, topic.lesson_exercises)
+        validate_interactive_video_timeline(checkpoints, exercises)
         drafts = [item.model_dump() for item_index, item in enumerate(topic.interactive_video_drafts) if item_index != index]
         revision = await self._start_content_revision(topic)
         await self.topic_repository.update_fields(topic_id, {
+            "lesson_exercises": [item.model_dump() for item in exercises],
             "interactive_video_checkpoints": [item.model_dump() for item in checkpoints],
             "interactive_video_drafts": drafts,
             **revision,

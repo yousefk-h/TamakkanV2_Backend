@@ -10,8 +10,9 @@ from app.core.interactive_video_drafting import (
     get_interactive_video_drafter,
 )
 from app.models.ai_generation import AIGenerationType
-from app.models.topic_content import InteractiveVideoCheckpoint, InteractiveVideoTimelineSuggestion, LessonFlow
+from app.models.topic_content import InteractiveVideoCheckpoint, InteractiveVideoTimelineSuggestion, LessonExercise, LessonFlow
 from app.models.user import User
+from app.schema.topic import LessonExerciseIn
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
 
 
@@ -29,8 +30,6 @@ class InteractiveVideoDraftService:
         timestamped = [segment for segment in topic.raw_transcript if segment.duration > 0 or segment.start > 0]
         if not timestamped or len((topic.approved_transcript or "").strip()) < 100:
             raise UnprocessableException("Approve timestamped video source material before requesting timeline suggestions")
-        if not topic.lesson_exercises:
-            raise UnprocessableException("Add lesson exercises before requesting timeline suggestions")
         source = "\n".join(f"[{segment.start:.1f}s-{segment.start + segment.duration:.1f}s] {segment.text}" for segment in timestamped)
         source = source[:get_settings().MAX_DRAFTING_SOURCE_CHARS]
         exercises = [f"{index}: {exercise.kind.value} — {exercise.prompt}" for index, exercise in enumerate(topic.lesson_exercises)]
@@ -47,14 +46,37 @@ class InteractiveVideoDraftService:
             max_time = max(segment.start + segment.duration for segment in timestamped)
             drafts: list[InteractiveVideoTimelineSuggestion] = []
             accepted = list(topic.interactive_video_checkpoints)
+            draft_exercises: list[LessonExercise] = []
             for proposal in proposed:
-                candidate = InteractiveVideoCheckpoint(**proposal.model_dump(exclude={"rationale"}))
+                exercise_index = proposal.exercise_index
+                exercise: LessonExercise | None = None
+                if proposal.exercise is not None:
+                    try:
+                        exercise = LessonExerciseIn.model_validate(proposal.exercise)
+                    except Exception:
+                        continue
+                    exercise_index = len(topic.lesson_exercises) + len(draft_exercises)
+                if exercise_index is None:
+                    continue
+                candidate = InteractiveVideoCheckpoint(
+                    timestamp_seconds=proposal.timestamp_seconds,
+                    exercise_index=exercise_index,
+                    completion_rule=proposal.completion_rule,
+                )
                 try:
-                    validate_interactive_video_timeline(sorted([*accepted, candidate], key=lambda item: item.timestamp_seconds), topic.lesson_exercises, duration_seconds=max_time)
+                    validate_interactive_video_timeline(
+                        sorted([*accepted, candidate], key=lambda item: item.timestamp_seconds),
+                        [*topic.lesson_exercises, *draft_exercises, *([exercise] if exercise else [])],
+                        duration_seconds=max_time,
+                    )
                 except UnprocessableException:
                     continue
                 accepted.append(candidate)
-                drafts.append(InteractiveVideoTimelineSuggestion(**candidate.model_dump(), rationale=proposal.rationale.strip()))
+                if exercise:
+                    draft_exercises.append(exercise)
+                drafts.append(InteractiveVideoTimelineSuggestion(
+                    **candidate.model_dump(), rationale=proposal.rationale.strip(), exercise=exercise,
+                ))
             if not drafts:
                 raise InteractiveVideoDraftingError("Provider returned no valid checkpoint suggestions")
         except InteractiveVideoDraftingNotConfigured as exc:

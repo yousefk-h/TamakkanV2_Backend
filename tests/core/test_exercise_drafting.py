@@ -1,4 +1,4 @@
-from app.core.exercise_drafting import DraftExerciseOutput
+from app.core.exercise_drafting import DraftExerciseOutput, OUTPUT_CONTRACT
 from app.schema.topic import LessonExerciseIn
 
 
@@ -18,3 +18,9 @@ def test_raw_provider_item_still_requires_a_valid_lesson_exercise():
     exercise = LessonExerciseIn.model_validate(raw)
     assert exercise.kind.value == "writing"
     assert exercise.min_words == 20
+
+
+def test_small_provider_schema_has_an_explicit_persisted_field_contract():
+    assert "`prompt`" in OUTPUT_CONTRACT
+    assert "Never use `question`" in OUTPUT_CONTRACT
+    assert "writing: return only `kind`, `prompt`" in OUTPUT_CONTRACT

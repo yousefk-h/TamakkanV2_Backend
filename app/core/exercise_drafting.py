@@ -54,6 +54,33 @@ narrow); the first turn is never blank. Do not produce video, vocabulary, or
 image-completion blocks: those require teacher media or the existing
 vocabulary drafting path. This is a draft, not content approved for students."""
 
+# ``DraftExerciseOutput`` intentionally uses a small JSON-object envelope so
+# Gemini never has to consume the giant union-like schema for every activity
+# type.  It therefore needs an equally explicit field contract in the prompt;
+# otherwise a provider can reasonably return ``question`` rather than our
+# persisted field name ``prompt``.
+OUTPUT_CONTRACT = """
+JSON FIELD CONTRACT (mandatory): return an object with an `exercises` array.
+Every array item must use `kind` (exactly the requested kind) and `prompt`
+(the student-facing instruction). Never use `question`, `title`, `answers`,
+or prose outside the JSON object.
+
+- multiple_choice, listening, grammar and reading: also return `options`
+  (2-4 non-empty strings) and `correct_option` (zero-based index). Listening,
+  grammar and reading also require `content`.
+- writing: return only `kind`, `prompt`, and optionally `min_words`.
+- speaking or reflection: return only `kind` and `prompt`.
+- game: return `kind`, `prompt`, and `pairs`, where each pair is
+  {"left":"...", "right":"..."}; include 2-6 pairs.
+- series: return `kind`, `prompt`, and `content`.
+- word_order: return `kind`, `prompt`, and `ordering_words` in correct order.
+- error_correction: return `kind`, `prompt`, `content`, `accepted_answers`,
+  and `explanation`.
+- dialogue_completion: return `kind`, `prompt`, and `dialogue_turns` with
+  speaker/text/is_blank/accepted_answers fields.
+Only include fields that belong to the requested kind.
+"""
+
 
 class DraftExerciseOutput(BaseModel):
     """The small provider-facing contract for exercise generation.
@@ -93,7 +120,10 @@ def _get_agent() -> Agent[None, DraftExerciseOutput]:
     global _agent
     if _agent is None:
         provider = GoogleProvider(api_key=get_settings().GEMINI_API_KEY)
-        _agent = Agent(GoogleModel(MODEL, provider=provider), output_type=DraftExerciseOutput, system_prompt=SYSTEM_PROMPT)
+        _agent = Agent(
+            GoogleModel(MODEL, provider=provider), output_type=DraftExerciseOutput,
+            system_prompt=f"{SYSTEM_PROMPT}\n\n{OUTPUT_CONTRACT}",
+        )
     return _agent
 
 

@@ -311,16 +311,17 @@ class InteractiveVideoTimelineUpdate(BaseModel):
 class InteractiveVideoTimelineSuggestionPublic(BaseModel):
     id: str
     timestamp_seconds: float
-    exercise_index: int
+    exercise_index: Optional[int] = None
     completion_rule: str
     rationale: str = ""
+    exercise: Optional[LessonExerciseIn] = None
 
     @classmethod
     def from_suggestion(cls, item: InteractiveVideoTimelineSuggestion) -> "InteractiveVideoTimelineSuggestionPublic":
         return cls(
             id=item.id, timestamp_seconds=item.timestamp_seconds,
             exercise_index=item.exercise_index, completion_rule=item.completion_rule.value,
-            rationale=item.rationale,
+            rationale=item.rationale, exercise=item.exercise,
         )
 
 

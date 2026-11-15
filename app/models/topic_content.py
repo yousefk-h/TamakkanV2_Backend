@@ -255,10 +255,21 @@ class InteractiveVideoCheckpoint(BaseModel):
     completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
 
 
-class InteractiveVideoTimelineSuggestion(InteractiveVideoCheckpoint):
-    """Private AI proposal, never active until a teacher accepts it."""
+class InteractiveVideoTimelineSuggestion(BaseModel):
+    """Private AI proposal, never active until a teacher accepts it.
 
+    Older proposals point at an already-authored exercise.  New proposals may
+    carry a complete editable exercise draft instead, so the AI can recommend
+    both a meaningful video moment and the suitable activity type without
+    publishing either one automatically.
+    """
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    timestamp_seconds: float = Field(ge=0)
+    exercise_index: Optional[int] = Field(default=None, ge=0)
+    completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
     rationale: str = Field(default="", max_length=500)
+    exercise: Optional[LessonExercise] = None
 
 
 class LessonDraftStepState(str, Enum):
