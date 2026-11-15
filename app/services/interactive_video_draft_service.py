@@ -52,7 +52,9 @@ class InteractiveVideoDraftService:
                 exercise: LessonExercise | None = None
                 if proposal.exercise is not None:
                     try:
-                        exercise = LessonExerciseIn.model_validate(proposal.exercise)
+                        exercise = LessonExerciseIn.model_validate(
+                            proposal.exercise.model_dump(exclude_none=True, exclude_defaults=True)
+                        )
                     except Exception:
                         continue
                     exercise_index = len(topic.lesson_exercises) + len(draft_exercises)

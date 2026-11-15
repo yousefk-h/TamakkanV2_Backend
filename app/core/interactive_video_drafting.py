@@ -4,7 +4,7 @@ The provider gets timestamped transcript segments, not a document-only source;
 without real time references it is deliberately never invoked.
 """
 
-from typing import Any, Protocol
+from typing import Optional, Protocol
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -37,13 +37,49 @@ grammar and reading include 2-4 `options`, a zero-based `correct_option`, and
 `explanation`; dialogue_completion needs `dialogue_turns`."""
 
 
+class TimelineExercisePair(BaseModel):
+    """A provider-facing pair with no free-form JSON values.
+
+    Gemini's native structured-output endpoint rejects open-ended objects
+    (``dict[str, Any]``).  Keep the provider contract concrete and validate
+    it once more against ``LessonExerciseIn`` before persistence.
+    """
+
+    left: str
+    right: str
+
+
+class TimelineDialogueTurn(BaseModel):
+    speaker: str
+    text: str = ""
+    is_blank: bool = False
+    accepted_answers: list[str] = Field(default_factory=list)
+
+
+class TimelineExerciseProposal(BaseModel):
+    """Small, concrete superset of editable activity fields Gemini may use."""
+
+    kind: str
+    prompt: str
+    content: Optional[str] = None
+    options: Optional[list[str]] = None
+    correct_option: Optional[int] = None
+    explanation: Optional[str] = None
+    arabic_note: Optional[str] = None
+    pairs: Optional[list[TimelineExercisePair]] = None
+    ordering_words: Optional[list[str]] = None
+    accepted_answers: Optional[list[str]] = None
+    dialogue_turns: Optional[list[TimelineDialogueTurn]] = None
+    min_words: Optional[int] = None
+
+
 class TimelineProposal(BaseModel):
     timestamp_seconds: float = Field(ge=0)
     # Kept only to read pre-existing provider/test proposals. New work uses
     # the editable activity draft below rather than forcing a teacher to make
     # all activities before AI can help with placement.
     exercise_index: int | None = Field(default=None, ge=0)
-    exercise: dict[str, Any] | None = None
+    exercise: TimelineExerciseProposal | None = None
     completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
     rationale: str = Field(min_length=1, max_length=500)
 
