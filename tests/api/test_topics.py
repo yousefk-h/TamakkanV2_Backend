@@ -581,6 +581,16 @@ async def test_interactive_video_checkpoint_suggestions_stay_private_until_accep
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["interactive_video_checkpoints"][0]["timestamp_seconds"] == 8
     assert accepted.json()["interactive_video_drafts"] == []
+    # A Studio edit travels through the generic Topic PATCH route. It must
+    # validate JSON-ready exercises as typed models, not crash on a dict.
+    edited = client.patch(f"/api/v1/topics/{topic['id']}", headers=headers, json={
+        "lesson_exercises": [{
+            "kind": "multiple_choice", "prompt": "Which greeting did you hear?",
+            "options": ["Hello", "Bye"], "correct_option": 0,
+        }],
+    })
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["lesson_exercises"][0]["prompt"] == "Which greeting did you hear?"
 
 
 async def test_interactive_video_ai_can_propose_an_editable_activity_and_checkpoint(client):

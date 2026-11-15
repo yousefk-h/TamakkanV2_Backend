@@ -33,7 +33,7 @@ from app.repositories.topic_content_repository import DEFAULT_PAGE_SIZE, TopicCo
 from app.repositories.unit_repository import UnitRepository
 from app.repositories.user_repository import UserRepository
 from app.schema.challenge import LessonDayState
-from app.schema.topic import EnrolledStudent, LearningObjectivesUpdate, TopicAdminDetail, TopicCreate, TopicUpdate
+from app.schema.topic import EnrolledStudent, LearningObjectivesUpdate, LessonExerciseIn, TopicAdminDetail, TopicCreate, TopicUpdate
 from app.services.progress_service import ProgressService, get_progress_service
 from app.utils.time import utcnow
 
@@ -356,7 +356,13 @@ class TopicContentService:
         # An exercise list and an Interactive Video timeline are one revision
         # contract. Reject a dangling checkpoint before saving either side.
         if "lesson_exercises" in changes and topic.lesson_flow == LessonFlow.INTERACTIVE_VIDEO:
-            validate_interactive_video_timeline(topic.interactive_video_checkpoints, changes["lesson_exercises"])
+            # ``model_dump`` intentionally produces JSON-ready dictionaries.
+            # Rehydrate them before timeline validation: the validator needs
+            # the typed ``LessonExercise`` interface, not raw dicts.  This
+            # used to turn an ordinary Studio edit into a 500 after an AI
+            # draft had been accepted.
+            exercises_for_validation = [LessonExerciseIn.model_validate(item) for item in changes["lesson_exercises"]]
+            validate_interactive_video_timeline(topic.interactive_video_checkpoints, exercises_for_validation)
         if changes:
             changes.update(await self._start_content_revision(topic))
             await self.topic_repository.update_fields(topic_id, changes)
