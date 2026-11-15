@@ -269,6 +269,11 @@ class InteractiveVideoTimelineSuggestion(BaseModel):
     exercise_index: Optional[int] = Field(default=None, ge=0)
     completion_rule: InteractiveVideoCompletionRule = InteractiveVideoCompletionRule.SUBMITTED
     rationale: str = Field(default="", max_length=500)
+    # Teacher-facing pedagogical context. This stays with the private draft
+    # and lets the teacher judge the learning value, not just the wording.
+    learning_action: str = Field(default="apply", max_length=40)
+    learning_goal: str = Field(default="", max_length=280)
+    source_evidence: str = Field(default="", max_length=500)
     exercise: Optional[LessonExercise] = None
 
 

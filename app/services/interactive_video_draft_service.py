@@ -16,6 +16,23 @@ from app.schema.topic import LessonExerciseIn
 from app.services.topic_content_service import TopicContentService, get_topic_content_service
 
 
+def _is_literal_recall(proposal: TimelineProposal) -> bool:
+    """Catch the common low-value transcript-copy prompts before persistence.
+
+    This is intentionally a narrow server-side guard, not a replacement for
+    the model's pedagogical judgement.  It protects teachers when a provider
+    ignores the prompt and makes the rule testable without a live model call.
+    """
+    text = (proposal.exercise.prompt if proposal.exercise else "").lower().replace("’", "'")
+    literal_patterns = (
+        "what does the speaker say", "what did the speaker say", "what does she say",
+        "what did she say", "what does he say", "what did he say",
+        "according to the video", "complete the sentence", "complete this phrase",
+        "repeat the phrase", "exact words",
+    )
+    return proposal.learning_action != "listening_detail" and any(pattern in text for pattern in literal_patterns)
+
+
 class InteractiveVideoDraftService:
     def __init__(self, topics: TopicContentService, drafter: InteractiveVideoDrafter) -> None:
         self.topics = topics
@@ -48,6 +65,8 @@ class InteractiveVideoDraftService:
             accepted = list(topic.interactive_video_checkpoints)
             draft_exercises: list[LessonExercise] = []
             for proposal in proposed:
+                if _is_literal_recall(proposal):
+                    continue
                 exercise_index = proposal.exercise_index
                 exercise: LessonExercise | None = None
                 if proposal.exercise is not None:
@@ -78,6 +97,9 @@ class InteractiveVideoDraftService:
                     draft_exercises.append(exercise)
                 drafts.append(InteractiveVideoTimelineSuggestion(
                     **candidate.model_dump(), rationale=proposal.rationale.strip(), exercise=exercise,
+                    learning_action=proposal.learning_action,
+                    learning_goal=proposal.learning_goal.strip(),
+                    source_evidence=proposal.source_evidence.strip(),
                 ))
             if not drafts:
                 raise InteractiveVideoDraftingError("Provider returned no valid checkpoint suggestions")

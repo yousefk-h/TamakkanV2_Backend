@@ -314,6 +314,9 @@ class InteractiveVideoTimelineSuggestionPublic(BaseModel):
     exercise_index: Optional[int] = None
     completion_rule: str
     rationale: str = ""
+    learning_action: str = "apply"
+    learning_goal: str = ""
+    source_evidence: str = ""
     exercise: Optional[LessonExerciseIn] = None
 
     @classmethod
@@ -322,6 +325,8 @@ class InteractiveVideoTimelineSuggestionPublic(BaseModel):
             id=item.id, timestamp_seconds=item.timestamp_seconds,
             exercise_index=item.exercise_index, completion_rule=item.completion_rule.value,
             rationale=item.rationale, exercise=item.exercise,
+            learning_action=item.learning_action, learning_goal=item.learning_goal,
+            source_evidence=item.source_evidence,
         )
 
 
