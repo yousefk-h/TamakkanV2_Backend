@@ -145,7 +145,13 @@ class TimelineProposal(BaseModel):
 
 
 class TimelineProposals(BaseModel):
-    checkpoints: list[TimelineProposal] = Field(min_length=1, max_length=12)
+    # Empirically capped at 8, not higher: Gemini's native structured-output
+    # endpoint returns a bare 400 INVALID_ARGUMENT once this schema's
+    # `maxItems` goes much past this (confirmed live - 8 succeeds, 10 and 12
+    # both 400 with no further detail from the provider). This is a provider
+    # schema-complexity limit, not a product/pedagogical choice - do not
+    # raise it without re-confirming against a real call first.
+    checkpoints: list[TimelineProposal] = Field(min_length=1, max_length=8)
 
 
 class InteractiveVideoDraftingError(Exception):
