@@ -105,14 +105,6 @@ def log_session_end(source: str, result: "MarkEndedResult", state_before: str, s
     )
 
 
-# A Practice with Mariam checkpoint session must show genuine participation,
-# not merely reach `ENDED` - see `LiveSessionService
-# ._is_meaningful_practice_completion`. Chosen to exclude a near-instant
-# connect-then-hangup (no real exchange could happen in a couple of seconds)
-# without penalizing a real, fast exchange.
-MIN_CHECKPOINT_PRACTICE_SECONDS = 12
-
-
 @dataclass
 class MarkEndedResult:
     session: LiveSession
@@ -992,27 +984,53 @@ class LiveSessionService:
 
     def _is_meaningful_practice_completion(self, session: LiveSession) -> bool:
         """A Practice with Mariam checkpoint must never unlock just because a
-        `LiveSession` reached `ENDED` - a student who connects and
-        immediately hangs up (zero real exchange) reaches `ENDED` through the
-        exact same `CONNECTED -> ENDED` transition as a genuine conversation
-        (`end_reason` `user_ended`/`idle_timeout`/`max_duration_reached`/
-        `agent_ended` all land here; only a real connection failure routes to
-        the separate `CONNECTION_FAILED` state, already excluded below).
-        Requires real, trustworthy evidence instead: `ENDED` state, at least
-        one real turn from each side in the agent-written `transcript_history`
-        (never the student-reported-only `browser_transcript`), and at least
-        `MIN_CHECKPOINT_PRACTICE_SECONDS` actually elapsed between
-        `started_at`/`ended_at` - all three together rule out an instant
-        connect-then-hangup while never penalizing a real, fast exchange."""
+        `LiveSession` reached `ENDED`, and - corrected per explicit owner
+        feedback - a short elapsed-time threshold (e.g. "12 seconds, one
+        turn each") is not good enough either: a student who exchanges one
+        real turn each and then manually ends at 15 seconds of a
+        teacher-configured 2-minute checkpoint must NOT unlock it just
+        because that crossed some fixed number picked by this code, not by
+        the teacher.
+
+        This codebase has no server/agent-side signal that judges whether the
+        teacher's specific `conversation_goal` was actually fulfilled - the
+        LiveKit Agents SDK's own `CloseReason` (`USER_INITIATED`,
+        `PARTICIPANT_DISCONNECTED`, `TASK_COMPLETED`, `JOB_SHUTDOWN`) are all
+        collapsed to the identical `EndReason.USER_ENDED` by
+        `livekit_agent/agent.py` - `TASK_COMPLETED` is the SDK's own generic
+        "the agent task loop returned" event, not a judgment that the
+        teacher's goal was met, and there is no function-tool or other
+        mechanism anywhere in this pipeline by which the agent (or anything
+        else) reports "the practice goal was achieved". Inventing a semantic
+        reading of `TASK_COMPLETED` (or of transcript content/length) as
+        "goal fulfilled" would be exactly the fabricated success condition
+        the owner asked this code NOT to invent.
+
+        The one reason value that IS a trustworthy, non-fabricated,
+        non-student-spoofable signal of real completion is
+        `EndReason.MAX_DURATION` - set only by the `livekit_agent` worker's
+        own server-side `_enforce_max_duration` timer (never by a browser;
+        `mark-ended` is internal-agent-only, see `require_internal_agent`),
+        fired only once the session has actually run for the FULL duration
+        `start_session` granted it - and that granted duration is already
+        exactly `min(checkpoint.session_duration_minutes, the student's
+        remaining per-topic session-minute budget)` (see `start_session`
+        above), so this one check already respects both the teacher's
+        configured length and the student's remaining budget without
+        needing to re-derive or re-check either here. A genuine two-sided
+        transcript is still required on top of that, so a session the
+        student left silently connected and muted for the full window still
+        doesn't count as practice. Early manual/idle/connection-failure
+        endings - at 15 seconds or at 100 seconds of a 120-second window -
+        are correctly never completions by this rule, by design: this
+        infrastructure cannot reliably recognize early goal completion, so
+        it does not pretend to."""
         if session.state != SessionState.ENDED:
             return False
+        if session.end_reason != EndReason.MAX_DURATION:
+            return False
         speakers = {turn.speaker for turn in session.transcript_history}
-        if "student" not in speakers or "mariam" not in speakers:
-            return False
-        if session.ended_at is None:
-            return False
-        elapsed = (session.ended_at - session.started_at).total_seconds()
-        return elapsed >= MIN_CHECKPOINT_PRACTICE_SECONDS
+        return "student" in speakers and "mariam" in speakers
 
     async def get_checkpoint_session_status(self, student: User, checkpoint_id: str) -> "CheckpointSessionStatus":
         """Whether THIS student has a genuinely completed Practice with Mariam

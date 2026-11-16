@@ -633,11 +633,14 @@ async def test_checkpoint_session_still_enforces_entitlement_for_a_locked_topic(
 
 async def test_checkpoint_session_status_is_false_until_a_genuinely_completed_session_ends_then_true(client):
     """`completed` must require real evidence, not a bare `ENDED` state - see
-    `LiveSessionService._is_meaningful_practice_completion`. A session that
-    reaches `ENDED` with a real two-sided exchange and enough elapsed time
-    flips it to `True`; the other new tests below cover each way a session
-    can reach `ENDED` WITHOUT that evidence and confirm `completed` stays
-    `False` for every one of them."""
+    `LiveSessionService._is_meaningful_practice_completion`. The only
+    trustworthy signal this infrastructure has for "the practice actually
+    ran its course" is `EndReason.MAX_DURATION` - set only by the
+    `livekit_agent` worker's own server-side timer once the FULL
+    teacher-configured, budget-capped duration has elapsed - combined with a
+    genuine two-sided transcript. The other new tests below cover each way a
+    session can reach `ENDED` WITHOUT that evidence and confirm `completed`
+    stays `False` for every one of them."""
     token, _ = await _login_with_user(client, Role.STUDENT)
     topic, checkpoint_id = await _make_checkpoint_topic()
 
@@ -662,20 +665,17 @@ async def test_checkpoint_session_status_is_false_until_a_genuinely_completed_se
     assert mid.json()["completed"] is False
     assert mid.json()["latest_session_id"] == started["session_id"]
 
-    # Simulate a real amount of elapsed call time - `started_at` is set
-    # server-side at `start()` and can't be backdated through any request
-    # body, so the only way to exercise the duration check here is to move
-    # it into the past directly, the same way a real multi-second call would
-    # naturally satisfy it.
-    session = await LiveSession.get(started["session_id"])
-    session.started_at = utcnow() - timedelta(seconds=30)
-    await session.save()
-
+    # The real `livekit_agent` worker reports `max_duration_reached` only
+    # once its own `_enforce_max_duration` timer actually fires, at the
+    # exact duration `start_session` granted (the teacher's configured
+    # `session_duration_minutes` capped by the student's remaining budget) -
+    # `mark-ended` is internal-agent-only (`require_internal_agent`), so a
+    # student can never send this reason themselves.
     client.post(
         f"/api/v1/sessions/{started['session_id']}/mark-ended",
-        json={"end_reason": "user_ended", "transcript_history": [
-            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
-            {"speaker": "mariam", "text": "Hello! How are you?", "timestamp": "2026-01-01T00:00:02"},
+        json={"end_reason": "max_duration_reached", "transcript_history": [
+            {"speaker": "student", "text": "Hi, I'd like to order a coffee please.", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "mariam", "text": "Of course! What size would you like?", "timestamp": "2026-01-01T00:00:02"},
         ]},
         headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
     )
@@ -719,25 +719,32 @@ async def test_checkpoint_session_status_stays_false_for_an_instant_hangup_with_
     assert status.json()["latest_session_state"] == "ended"
 
 
-async def test_checkpoint_session_status_stays_false_for_a_one_sided_transcript(client):
-    """Only the student (or only Mariam) ever having said anything is not a
-    real exchange - both sides must appear in the trusted transcript."""
+async def test_checkpoint_session_status_stays_false_for_an_early_hangup_after_two_real_turns(client):
+    """The exact scenario the owner flagged: a genuine two-sided exchange
+    (one real turn each) followed by the student manually ending the call
+    well before the teacher-configured duration elapsed. A real exchange
+    happening is not, by itself, evidence the practice goal was fulfilled -
+    only running the full configured/budgeted duration (`max_duration_reached`)
+    is currently a trustworthy signal of that, and this session never
+    reached it."""
     token, _ = await _login_with_user(client, Role.STUDENT)
-    topic, checkpoint_id = await _make_checkpoint_topic()
+    # A 2-minute checkpoint, manually ended at the (simulated) 15-second mark.
+    topic, checkpoint_id = await _make_checkpoint_topic(session_duration_minutes=2)
     started = client.post(
         "/api/v1/sessions/start",
         json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
         headers={"Authorization": f"Bearer {token}"},
     ).json()
+    assert started["max_duration_minutes"] == 2
     session = await LiveSession.get(started["session_id"])
-    session.started_at = utcnow() - timedelta(seconds=30)
+    session.started_at = utcnow() - timedelta(seconds=15)
     await session.save()
 
     client.post(
         f"/api/v1/sessions/{started['session_id']}/mark-ended",
         json={"end_reason": "user_ended", "transcript_history": [
-            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
-            {"speaker": "student", "text": "Hello?", "timestamp": "2026-01-01T00:00:01"},
+            {"speaker": "student", "text": "Hi there.", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "mariam", "text": "Hello! How can I help?", "timestamp": "2026-01-01T00:00:02"},
         ]},
         headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
     )
@@ -747,11 +754,13 @@ async def test_checkpoint_session_status_stays_false_for_a_one_sided_transcript(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert status.json()["completed"] is False
+    assert status.json()["latest_session_state"] == "ended"
 
 
-async def test_checkpoint_session_status_stays_false_for_a_real_exchange_that_was_too_short(client):
-    """A genuine two-sided transcript still isn't enough on its own - a
-    near-instant exchange (no real elapsed time) must not count either."""
+async def test_checkpoint_session_status_stays_false_for_a_one_sided_transcript_even_at_max_duration(client):
+    """Only the student (or only Mariam) ever having said anything is not a
+    real exchange - both sides must appear in the trusted transcript, even
+    when the session did run its full configured/budgeted duration."""
     token, _ = await _login_with_user(client, Role.STUDENT)
     topic, checkpoint_id = await _make_checkpoint_topic()
     started = client.post(
@@ -759,14 +768,12 @@ async def test_checkpoint_session_status_stays_false_for_a_real_exchange_that_wa
         json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
         headers={"Authorization": f"Bearer {token}"},
     ).json()
-    # `started_at` is left at its real, just-now value - mark-ended fires
-    # immediately after, so elapsed time is well under the minimum.
 
     client.post(
         f"/api/v1/sessions/{started['session_id']}/mark-ended",
-        json={"end_reason": "user_ended", "transcript_history": [
+        json={"end_reason": "max_duration_reached", "transcript_history": [
             {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
-            {"speaker": "mariam", "text": "Hello!", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "student", "text": "Hello?", "timestamp": "2026-01-01T00:00:01"},
         ]},
         headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
     )
@@ -789,9 +796,6 @@ async def test_checkpoint_session_status_stays_false_after_a_connection_failure(
         json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
         headers={"Authorization": f"Bearer {token}"},
     ).json()
-    session = await LiveSession.get(started["session_id"])
-    session.started_at = utcnow() - timedelta(seconds=30)
-    await session.save()
 
     client.post(
         f"/api/v1/sessions/{started['session_id']}/mark-ended",
@@ -822,12 +826,9 @@ async def test_checkpoint_session_status_persists_across_refresh_and_a_new_unfin
         json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
         headers={"Authorization": f"Bearer {token}"},
     ).json()
-    session = await LiveSession.get(first["session_id"])
-    session.started_at = utcnow() - timedelta(seconds=30)
-    await session.save()
     client.post(
         f"/api/v1/sessions/{first['session_id']}/mark-ended",
-        json={"end_reason": "user_ended", "transcript_history": [
+        json={"end_reason": "max_duration_reached", "transcript_history": [
             {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
             {"speaker": "mariam", "text": "Hello! How are you?", "timestamp": "2026-01-01T00:00:02"},
         ]},
