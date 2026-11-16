@@ -105,6 +105,14 @@ def log_session_end(source: str, result: "MarkEndedResult", state_before: str, s
     )
 
 
+# A Practice with Mariam checkpoint session must show genuine participation,
+# not merely reach `ENDED` - see `LiveSessionService
+# ._is_meaningful_practice_completion`. Chosen to exclude a near-instant
+# connect-then-hangup (no real exchange could happen in a couple of seconds)
+# without penalizing a real, fast exchange.
+MIN_CHECKPOINT_PRACTICE_SECONDS = 12
+
+
 @dataclass
 class MarkEndedResult:
     session: LiveSession
@@ -982,16 +990,42 @@ class LiveSessionService:
         )
         return "\n\n".join(blocks)
 
+    def _is_meaningful_practice_completion(self, session: LiveSession) -> bool:
+        """A Practice with Mariam checkpoint must never unlock just because a
+        `LiveSession` reached `ENDED` - a student who connects and
+        immediately hangs up (zero real exchange) reaches `ENDED` through the
+        exact same `CONNECTED -> ENDED` transition as a genuine conversation
+        (`end_reason` `user_ended`/`idle_timeout`/`max_duration_reached`/
+        `agent_ended` all land here; only a real connection failure routes to
+        the separate `CONNECTION_FAILED` state, already excluded below).
+        Requires real, trustworthy evidence instead: `ENDED` state, at least
+        one real turn from each side in the agent-written `transcript_history`
+        (never the student-reported-only `browser_transcript`), and at least
+        `MIN_CHECKPOINT_PRACTICE_SECONDS` actually elapsed between
+        `started_at`/`ended_at` - all three together rule out an instant
+        connect-then-hangup while never penalizing a real, fast exchange."""
+        if session.state != SessionState.ENDED:
+            return False
+        speakers = {turn.speaker for turn in session.transcript_history}
+        if "student" not in speakers or "mariam" not in speakers:
+            return False
+        if session.ended_at is None:
+            return False
+        elapsed = (session.ended_at - session.started_at).total_seconds()
+        return elapsed >= MIN_CHECKPOINT_PRACTICE_SECONDS
+
     async def get_checkpoint_session_status(self, student: User, checkpoint_id: str) -> "CheckpointSessionStatus":
-        """Whether THIS student has an ENDED Practice with Mariam session for
-        this one checkpoint - the lightweight completion signal a Practice
-        with Mariam checkpoint needs instead of an exercise attempt (see
-        `app.api.v1.topics.get_checkpoint_session_status`). Scoped to the
+        """Whether THIS student has a genuinely completed Practice with Mariam
+        session for this one checkpoint - the lightweight completion signal a
+        Practice with Mariam checkpoint needs instead of an exercise attempt
+        (see `app.api.v1.topics.get_checkpoint_session_status`). Scoped to the
         requesting student only - another student's sessions for the same
-        checkpoint are never visible here."""
+        checkpoint are never visible here. `completed` is `True` only when
+        `_is_meaningful_practice_completion` says so for at least one session -
+        a bare `ENDED` state is not enough, see that method's own doc."""
         sessions = await self.session_repository.get_for_student_and_checkpoint(student.id, checkpoint_id)
         latest = sessions[0] if sessions else None
-        completed = any(session.state == SessionState.ENDED for session in sessions)
+        completed = any(self._is_meaningful_practice_completion(session) for session in sessions)
         return CheckpointSessionStatus(
             completed=completed,
             latest_session_id=latest.id if latest else None,

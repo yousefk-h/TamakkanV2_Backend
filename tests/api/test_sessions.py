@@ -6,6 +6,7 @@ that call is monkeypatched out.
 """
 
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -630,7 +631,13 @@ async def test_checkpoint_session_still_enforces_entitlement_for_a_locked_topic(
     assert await LiveSession.find_all().to_list() == []
 
 
-async def test_checkpoint_session_status_is_false_until_a_session_ends_then_true(client):
+async def test_checkpoint_session_status_is_false_until_a_genuinely_completed_session_ends_then_true(client):
+    """`completed` must require real evidence, not a bare `ENDED` state - see
+    `LiveSessionService._is_meaningful_practice_completion`. A session that
+    reaches `ENDED` with a real two-sided exchange and enough elapsed time
+    flips it to `True`; the other new tests below cover each way a session
+    can reach `ENDED` WITHOUT that evidence and confirm `completed` stays
+    `False` for every one of them."""
     token, _ = await _login_with_user(client, Role.STUDENT)
     topic, checkpoint_id = await _make_checkpoint_topic()
 
@@ -655,10 +662,20 @@ async def test_checkpoint_session_status_is_false_until_a_session_ends_then_true
     assert mid.json()["completed"] is False
     assert mid.json()["latest_session_id"] == started["session_id"]
 
+    # Simulate a real amount of elapsed call time - `started_at` is set
+    # server-side at `start()` and can't be backdated through any request
+    # body, so the only way to exercise the duration check here is to move
+    # it into the past directly, the same way a real multi-second call would
+    # naturally satisfy it.
+    session = await LiveSession.get(started["session_id"])
+    session.started_at = utcnow() - timedelta(seconds=30)
+    await session.save()
+
     client.post(
         f"/api/v1/sessions/{started['session_id']}/mark-ended",
         json={"end_reason": "user_ended", "transcript_history": [
             {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "mariam", "text": "Hello! How are you?", "timestamp": "2026-01-01T00:00:02"},
         ]},
         headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
     )
@@ -670,6 +687,174 @@ async def test_checkpoint_session_status_is_false_until_a_session_ends_then_true
     assert after.json()["completed"] is True
     assert after.json()["latest_session_id"] == started["session_id"]
     assert after.json()["latest_session_state"] == "ended"
+
+
+async def test_checkpoint_session_status_stays_false_for_an_instant_hangup_with_no_real_exchange(client):
+    """Connecting and immediately ending with no transcript at all reaches
+    `ENDED` through the exact same transition a genuine conversation does -
+    `completed` must not be fooled by that alone."""
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic()
+    started = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    client.post(
+        f"/api/v1/sessions/{started['session_id']}/mark-connected",
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    client.post(
+        f"/api/v1/sessions/{started['session_id']}/mark-ended",
+        json={"end_reason": "user_ended", "transcript_history": []},
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    status = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert status.json()["completed"] is False
+    assert status.json()["latest_session_state"] == "ended"
+
+
+async def test_checkpoint_session_status_stays_false_for_a_one_sided_transcript(client):
+    """Only the student (or only Mariam) ever having said anything is not a
+    real exchange - both sides must appear in the trusted transcript."""
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic()
+    started = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    session = await LiveSession.get(started["session_id"])
+    session.started_at = utcnow() - timedelta(seconds=30)
+    await session.save()
+
+    client.post(
+        f"/api/v1/sessions/{started['session_id']}/mark-ended",
+        json={"end_reason": "user_ended", "transcript_history": [
+            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "student", "text": "Hello?", "timestamp": "2026-01-01T00:00:01"},
+        ]},
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    status = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert status.json()["completed"] is False
+
+
+async def test_checkpoint_session_status_stays_false_for_a_real_exchange_that_was_too_short(client):
+    """A genuine two-sided transcript still isn't enough on its own - a
+    near-instant exchange (no real elapsed time) must not count either."""
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic()
+    started = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    # `started_at` is left at its real, just-now value - mark-ended fires
+    # immediately after, so elapsed time is well under the minimum.
+
+    client.post(
+        f"/api/v1/sessions/{started['session_id']}/mark-ended",
+        json={"end_reason": "user_ended", "transcript_history": [
+            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "mariam", "text": "Hello!", "timestamp": "2026-01-01T00:00:00"},
+        ]},
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    status = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert status.json()["completed"] is False
+
+
+async def test_checkpoint_session_status_stays_false_after_a_connection_failure(client):
+    """A connection failure routes to the separate `CONNECTION_FAILED` state
+    (never `ENDED`) - confirms that path still can't be mistaken for
+    completion either, even with a (fabricated) two-sided transcript."""
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic()
+    started = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    session = await LiveSession.get(started["session_id"])
+    session.started_at = utcnow() - timedelta(seconds=30)
+    await session.save()
+
+    client.post(
+        f"/api/v1/sessions/{started['session_id']}/mark-ended",
+        json={"end_reason": "connection_failure", "transcript_history": [
+            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "mariam", "text": "Hello! How are you?", "timestamp": "2026-01-01T00:00:02"},
+        ]},
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    status = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert status.json()["completed"] is False
+    assert status.json()["latest_session_state"] == "connection_failed"
+
+
+async def test_checkpoint_session_status_persists_across_refresh_and_a_new_unfinished_retry(client):
+    """Once genuinely completed, `completed` stays `True` on a later read
+    (simulating a page refresh) and is not revoked by starting - but not yet
+    finishing - a second session for the same checkpoint (simulating a
+    student retrying/reconnecting)."""
+    token, _ = await _login_with_user(client, Role.STUDENT)
+    topic, checkpoint_id = await _make_checkpoint_topic()
+    first = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    session = await LiveSession.get(first["session_id"])
+    session.started_at = utcnow() - timedelta(seconds=30)
+    await session.save()
+    client.post(
+        f"/api/v1/sessions/{first['session_id']}/mark-ended",
+        json={"end_reason": "user_ended", "transcript_history": [
+            {"speaker": "student", "text": "Hi", "timestamp": "2026-01-01T00:00:00"},
+            {"speaker": "mariam", "text": "Hello! How are you?", "timestamp": "2026-01-01T00:00:02"},
+        ]},
+        headers={"X-Internal-Api-Key": FAKE_INTERNAL_API_KEY},
+    )
+
+    refreshed = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert refreshed.json()["completed"] is True
+
+    # A later retry/reconnect that hasn't itself ended yet must not revoke
+    # the already-earned completion - `latest_session_id` moves on, but
+    # `completed` stays true because of the earlier, real, finished session.
+    second = client.post(
+        "/api/v1/sessions/start",
+        json={"topic_id": topic.id, "checkpoint_id": checkpoint_id},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+    still_completed = client.get(
+        f"/api/v1/topics/{topic.id}/interactive-video-checkpoints/{checkpoint_id}/session-status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert still_completed.json()["completed"] is True
+    assert still_completed.json()["latest_session_id"] == second["session_id"]
+    assert still_completed.json()["latest_session_state"] == "connecting"
 
 
 async def test_checkpoint_session_status_does_not_leak_another_students_sessions(client):
