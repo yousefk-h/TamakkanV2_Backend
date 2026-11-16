@@ -39,6 +39,12 @@ class AnnouncementScope(str, Enum):
     CENTER = "center"
 
 
+class MessageKind(str, Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    AUDIO = "audio"
+
+
 class Conversation(BaseDocument):
     # Always exactly two ids: one Student, one staff member. Order is not
     # meaningful - every query filters with `$all`, never relies on position.
@@ -55,7 +61,21 @@ class Message(BaseDocument):
     conversation_id: Annotated[str, Indexed()]
     sender_id: Annotated[str, Indexed()]
     sender_role: Role
-    body: str
+    # Defaults to TEXT so every pre-existing message (inserted before this
+    # field existed) still loads and renders exactly as before.
+    kind: MessageKind = MessageKind.TEXT
+    # The typed body for a TEXT message; empty for IMAGE/AUDIO (their content
+    # is the media itself - an optional caption is intentionally not
+    # supported, keeping the attachment flow to one explicit step).
+    body: str = ""
+    # IMAGE/AUDIO only - the Cloudinary public_id of the uploaded asset
+    # (never the delivery URL itself: both storages are `authenticated`
+    # delivery type, so a usable URL has to be signed fresh server-side per
+    # response - see `MessagingService.media_url_for`).
+    media_public_id: Optional[str] = None
+    # AUDIO only - Cloudinary's own reported duration, read back after
+    # upload the same way `RecordingSubmission.duration_seconds` is.
+    media_duration_seconds: Optional[float] = None
     # `None` until the OTHER participant reads it - a sender's own messages
     # are never "unread" to themselves.
     read_at: Optional[datetime] = None

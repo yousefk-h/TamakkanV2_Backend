@@ -7,15 +7,18 @@ id list for a bulk send, only a scope to resolve. No AI is ever involved;
 a message body is exactly what its sender typed.
 """
 
+import uuid
 from datetime import timedelta
 from typing import Optional
 
+from loguru import logger
 from pymongo.errors import DuplicateKeyError
 
-from app.core.exceptions import ForbiddenException, NotFoundException, UnprocessableException
+from app.core.exceptions import ForbiddenException, NotFoundException, UnprocessableException, UpstreamServiceException
+from app.core.storage import AudioStorage, PrivateImageStorage, UploadFailedError, get_audio_storage, get_private_image_storage
 from app.models.cohort import Cohort
 from app.models.enrollment import Enrollment, EnrollmentStatus
-from app.models.message import Announcement, AnnouncementScope, Conversation, Message
+from app.models.message import Announcement, AnnouncementScope, Conversation, Message, MessageKind
 from app.models.program import Program
 from app.models.user import Role, User
 from app.schema.message import (
@@ -32,10 +35,40 @@ from app.utils.time import utcnow
 # in a row.
 MAX_MESSAGES_PER_MINUTE = 30
 
+# Mirrors `RecordingSubmissionService`'s own reasoning: the browser enforces a
+# cap while recording, this is the server-side backstop against a buggy or
+# bypassed client. A chat voice note is a quick aside, not a graded speaking
+# task, so the cap is intentionally much shorter than that flow's 2 minutes.
+MAX_VOICE_MESSAGE_SECONDS = 60
+MAX_VOICE_MESSAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_MESSAGE_UPLOAD_BYTES = 8 * 1024 * 1024
+UPLOAD_ATTEMPTS = 3
+CLOUDINARY_ROOT_FOLDER = "Tamakkan/messages"
+
+# A real file-type check against the actual bytes, never just the browser's
+# claimed Content-Type (the one thing this task's own instructions call out
+# by name) - magic-number prefixes covering every format a
+# `<input type="file" accept="image/*">`/mobile camera picker realistically
+# produces. Cloudinary's own upload is a second, independent real check: it
+# decodes the asset server-side and fails the whole request if it can't.
+_IMAGE_SIGNATURES = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a")
+
+
+def _looks_like_a_real_image(data: bytes) -> bool:
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return any(data.startswith(sig) for sig in _IMAGE_SIGNATURES)
+
 
 class MessagingService:
-    def __init__(self, cohort_service: CohortService) -> None:
+    def __init__(
+        self, cohort_service: CohortService,
+        image_storage: Optional[PrivateImageStorage] = None,
+        audio_storage: Optional[AudioStorage] = None,
+    ) -> None:
         self.cohort_service = cohort_service
+        self.image_storage = image_storage or get_private_image_storage()
+        self.audio_storage = audio_storage or get_audio_storage()
 
     async def _enforce_rate_limit(self, sender_id: str) -> None:
         since = utcnow() - timedelta(minutes=1)
@@ -57,18 +90,59 @@ class MessagingService:
         await conversation.insert()
         return conversation
 
+    async def _get_own_conversation(self, caller: User, conversation_id: str) -> Conversation:
+        """The one access-control check every per-conversation action shares -
+        a caller may act on a conversation only when they are actually one of
+        its two participants. Never trusts a client-supplied sender identity:
+        `caller` always comes from `get_current_user`, never the request body."""
+        conversation = await Conversation.find_one({"_id": conversation_id, "is_deleted": False})
+        if conversation is None or caller.id not in conversation.participant_ids:
+            raise ForbiddenException("You are not part of this conversation")
+        return conversation
+
+    def _preview_for(self, kind: MessageKind, body: str) -> str:
+        if kind == MessageKind.IMAGE:
+            return "📷 Photo"
+        if kind == MessageKind.AUDIO:
+            return "🎤 Voice message"
+        return body[:200]
+
     async def _append_message(
-        self, conversation: Conversation, sender: User, body: str, announcement_id: Optional[str] = None,
+        self, conversation: Conversation, sender: User, body: str, *,
+        kind: MessageKind = MessageKind.TEXT,
+        media_public_id: Optional[str] = None,
+        media_duration_seconds: Optional[float] = None,
+        announcement_id: Optional[str] = None,
     ) -> Message:
         message = Message(
             conversation_id=conversation.id, sender_id=sender.id, sender_role=sender.role,
-            body=body, announcement_id=announcement_id,
+            kind=kind, body=body, media_public_id=media_public_id, media_duration_seconds=media_duration_seconds,
+            announcement_id=announcement_id,
         )
         await message.insert()
         conversation.last_message_at = message.created_at
-        conversation.last_message_preview = body[:200]
+        conversation.last_message_preview = self._preview_for(kind, body)
         await conversation.save()
         return message
+
+    def media_url_for(self, message: Message) -> Optional[str]:
+        """Signed fresh per response, never stored - same reasoning as
+        `RecordingSubmissionService.media_url_for`: both storages are
+        `authenticated` delivery type, so a usable URL needs a signature
+        minted at response time, not a stored value."""
+        if message.media_public_id is None:
+            return None
+        storage = self.image_storage if message.kind == MessageKind.IMAGE else self.audio_storage
+        return storage.signed_url(message.media_public_id)
+
+    def _to_public(self, message: Message, sender_name: Optional[str], caller_id: str) -> MessagePublic:
+        return MessagePublic(
+            id=message.id, created_at=message.created_at, updated_at=message.updated_at,
+            conversation_id=message.conversation_id, sender_id=message.sender_id, sender_role=message.sender_role,
+            sender_name=sender_name, kind=message.kind, body=message.body,
+            media_url=self.media_url_for(message), media_duration_seconds=message.media_duration_seconds,
+            read_at=message.read_at, announcement_id=message.announcement_id, is_mine=(message.sender_id == caller_id),
+        )
 
     async def send_new_message(self, sender: User, student_id: str, body: str) -> MessagePublic:
         """Teacher/Admin only - a Student replies to an existing conversation
@@ -82,23 +156,80 @@ class MessagingService:
             raise ForbiddenException("You are not authorized to message this student")
         conversation = await self._get_or_create_conversation(sender.id, student.id)
         message = await self._append_message(conversation, sender, body)
-        return MessagePublic(
-            id=message.id, created_at=message.created_at, updated_at=message.updated_at,
-            conversation_id=conversation.id, sender_id=sender.id, sender_role=sender.role,
-            sender_name=sender.full_name, body=body, read_at=None, is_mine=True,
-        )
+        return self._to_public(message, sender.full_name, sender.id)
 
     async def reply(self, sender: User, conversation_id: str, body: str) -> MessagePublic:
         await self._enforce_rate_limit(sender.id)
-        conversation = await Conversation.find_one({"_id": conversation_id, "is_deleted": False})
-        if conversation is None or sender.id not in conversation.participant_ids:
-            raise ForbiddenException("You are not part of this conversation")
+        conversation = await self._get_own_conversation(sender, conversation_id)
         message = await self._append_message(conversation, sender, body)
-        return MessagePublic(
-            id=message.id, created_at=message.created_at, updated_at=message.updated_at,
-            conversation_id=conversation.id, sender_id=sender.id, sender_role=sender.role,
-            sender_name=sender.full_name, body=body, read_at=None, is_mine=True,
-        )
+        return self._to_public(message, sender.full_name, sender.id)
+
+    async def _upload_with_retry(self, storage, file_bytes: bytes, public_id: str):
+        last_error: Exception = UploadFailedError("no attempt was made")
+        for _ in range(UPLOAD_ATTEMPTS):
+            try:
+                return await storage.upload(file_bytes, public_id)
+            except UploadFailedError as exc:
+                last_error = exc
+        logger.error("Message media upload failed after {} attempts: {}", UPLOAD_ATTEMPTS, last_error)
+        raise UpstreamServiceException("Could not upload the attachment. Please try again.")
+
+    async def send_image_message(self, sender: User, conversation_id: str, file_bytes: bytes, content_type: str) -> MessagePublic:
+        """Student or Teacher/Admin, within a conversation they're already a
+        real participant of - never a new conversation (same boundary as
+        `reply`). Validates the actual bytes, not the browser's claimed
+        Content-Type, before ever touching storage."""
+        await self._enforce_rate_limit(sender.id)
+        if not content_type.startswith("image/"):
+            raise UnprocessableException(f"Expected an image file, got '{content_type}'")
+        if not file_bytes or len(file_bytes) > MAX_IMAGE_MESSAGE_UPLOAD_BYTES:
+            raise UnprocessableException("Image is empty or larger than the message attachment limit")
+        if not _looks_like_a_real_image(file_bytes):
+            raise UnprocessableException("This file is not a valid image")
+        conversation = await self._get_own_conversation(sender, conversation_id)
+        public_id = f"{CLOUDINARY_ROOT_FOLDER}/images/{conversation_id}-{uuid.uuid4().hex}"
+        result = await self._upload_with_retry(self.image_storage, file_bytes, public_id)
+        try:
+            message = await self._append_message(conversation, sender, "", kind=MessageKind.IMAGE, media_public_id=result.public_id)
+        except Exception:
+            await self._delete_orphan(self.image_storage, result.public_id)
+            raise
+        return self._to_public(message, sender.full_name, sender.id)
+
+    async def send_voice_message(self, sender: User, conversation_id: str, file_bytes: bytes, content_type: str) -> MessagePublic:
+        """Mirrors `send_image_message`; duration can only be checked AFTER
+        upload (Cloudinary's own reported value - see `AudioStorage`'s own
+        docstring for why there's no earlier, reliable way to read it from an
+        arbitrary browser-recorded container)."""
+        await self._enforce_rate_limit(sender.id)
+        if not content_type.startswith("audio/"):
+            raise UnprocessableException(f"Expected an audio file, got '{content_type}'")
+        if not file_bytes or len(file_bytes) > MAX_VOICE_MESSAGE_UPLOAD_BYTES:
+            raise UnprocessableException("Recording is empty or larger than a voice message should ever be")
+        conversation = await self._get_own_conversation(sender, conversation_id)
+        public_id = f"{CLOUDINARY_ROOT_FOLDER}/audio/{conversation_id}-{uuid.uuid4().hex}"
+        result = await self._upload_with_retry(self.audio_storage, file_bytes, public_id)
+        try:
+            if result.duration_seconds > MAX_VOICE_MESSAGE_SECONDS:
+                raise UnprocessableException(
+                    f"Voice message is {result.duration_seconds:.0f}s, longer than the {MAX_VOICE_MESSAGE_SECONDS}s limit"
+                )
+            message = await self._append_message(
+                conversation, sender, "", kind=MessageKind.AUDIO,
+                media_public_id=result.public_id, media_duration_seconds=result.duration_seconds,
+            )
+        except Exception:
+            await self._delete_orphan(self.audio_storage, result.public_id)
+            raise
+        return self._to_public(message, sender.full_name, sender.id)
+
+    async def _delete_orphan(self, storage, public_id: str) -> None:
+        """Best-effort - see `RecordingSubmissionService._delete_orphan`'s own
+        doc for why this deliberately swallows its own failure."""
+        try:
+            await storage.delete(public_id)
+        except UploadFailedError as exc:
+            logger.error("Orphaned message media {} - delete failed: {}", public_id, exc)
 
     async def list_inbox(self, caller: User, page: int, limit: int) -> tuple[list[ConversationSummary], int]:
         total = await Conversation.find({"participant_ids": caller.id, "is_deleted": False}).count()
@@ -137,11 +268,7 @@ class MessagingService:
         await Message.find({"conversation_id": conversation_id, "sender_id": {"$ne": caller.id}, "read_at": None}) \
             .update({"$set": {"read_at": utcnow()}})
         items = [
-            MessagePublic(
-                id=m.id, created_at=m.created_at, updated_at=m.updated_at, conversation_id=m.conversation_id,
-                sender_id=m.sender_id, sender_role=m.sender_role, sender_name=senders.get(m.sender_id).full_name if senders.get(m.sender_id) else None,
-                body=m.body, read_at=m.read_at, announcement_id=m.announcement_id, is_mine=(m.sender_id == caller.id),
-            )
+            self._to_public(m, senders.get(m.sender_id).full_name if senders.get(m.sender_id) else None, caller.id)
             for m in messages
         ]
         return MessagePage(items=items, total=total, page=page, limit=limit)
