@@ -1,11 +1,88 @@
 """Teacher/Student/Admin messaging (Teacher Workspace Increment 3): 1:1
 conversations, teacher bulk announcements (Cohort/Program/"my students"),
 Admin center broadcast, and the authorization/dedup/duplicate-send rules
-around all three.
+around all three. Image/voice attachments use `FakeImageStorage`/
+`FakeAudioStorage` instead of real Cloudinary - same reasoning as
+`test_submissions.py`'s own `FakeAudioStorage` (both storages are
+Protocols exactly so tests don't need real provider credentials).
 """
 
+import pytest
+
+from app.core.application import app
+from app.core.storage import ImageUploadResult, UploadFailedError, UploadResult
 from app.models.user import Role
+from app.services.cohort_service import get_cohort_service
+from app.services.messaging_service import MessagingService, get_messaging_service
 from tests.api.test_cohorts import _create_cohort, _create_program, _login, _stage_id
+
+
+class FakeImageStorage:
+    """Mirrors `test_submissions.py`'s `FakeAudioStorage` - records every
+    call, returns a scripted result/error, so tests can assert both the
+    outcome and that a failed/rejected upload's asset gets cleaned up."""
+
+    def __init__(self, fail_times: int = 0):
+        self.fail_times = fail_times
+        self.upload_calls: list[bytes] = []
+        self.public_ids: list[str] = []
+        self.deleted_public_ids: list[str] = []
+        self._attempt = 0
+
+    async def upload(self, file_bytes: bytes, public_id: str) -> ImageUploadResult:
+        self.upload_calls.append(file_bytes)
+        self.public_ids.append(public_id)
+        self._attempt += 1
+        if self._attempt <= self.fail_times:
+            raise UploadFailedError("simulated transient failure")
+        return ImageUploadResult(public_id=public_id, secure_url=f"https://cdn.example/{public_id}.jpg")
+
+    async def delete(self, public_id: str) -> None:
+        self.deleted_public_ids.append(public_id)
+
+    def signed_url(self, public_id: str) -> str:
+        return f"https://cdn.example/{public_id}.jpg?__cld_token__=signed"
+
+
+class FakeAudioStorage:
+    def __init__(self, durations=None, fail_times: int = 0):
+        self.durations = list(durations) if durations is not None else [10.0]
+        self.fail_times = fail_times
+        self.upload_calls: list[bytes] = []
+        self.public_ids: list[str] = []
+        self.deleted_public_ids: list[str] = []
+        self._attempt = 0
+
+    async def upload(self, file_bytes: bytes, public_id: str) -> UploadResult:
+        self.upload_calls.append(file_bytes)
+        self.public_ids.append(public_id)
+        self._attempt += 1
+        if self._attempt <= self.fail_times:
+            raise UploadFailedError("simulated transient failure")
+        duration = self.durations.pop(0) if self.durations else 10.0
+        return UploadResult(public_id=public_id, secure_url=f"https://cdn.example/{public_id}.m4a", duration_seconds=duration)
+
+    async def delete(self, public_id: str) -> None:
+        self.deleted_public_ids.append(public_id)
+
+    def signed_url(self, public_id: str) -> str:
+        return f"https://cdn.example/{public_id}.m4a?__cld_token__=signed"
+
+
+# A real JPEG magic-number prefix (the file-type sniff checks actual bytes,
+# not the claimed Content-Type) followed by filler - large enough to be a
+# plausible test payload without approaching the real size limit.
+_REAL_JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 200
+
+
+def _override_messaging_storage(image: FakeImageStorage, audio: FakeAudioStorage):
+    app.dependency_overrides[get_messaging_service] = lambda: MessagingService(get_cohort_service(), image, audio)
+
+
+@pytest.fixture(autouse=True)
+def _clear_messaging_overrides():
+    yield
+    app.dependency_overrides.pop(get_messaging_service, None)
 
 
 async def test_a_teacher_can_message_their_own_student_and_the_student_can_reply(client):
@@ -184,3 +261,158 @@ async def test_announcement_history_lists_only_the_senders_own_sent_items(client
     assert history_a["items"][0]["body"] == "A's note"
     history_b = client.get("/api/v1/messages/announcements", headers=teacher_b_headers).json()
     assert history_b["total"] == 0
+
+
+# --- Image/voice attachments ------------------------------------------------
+
+async def test_a_student_can_send_an_image_and_the_teacher_can_open_it(client):
+    admin, admin_headers = await _login(client, "msg-image-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "msg-image-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "msg-image-student@example.com", Role.STUDENT, created_by_id=teacher.id)
+    _override_messaging_storage(FakeImageStorage(), FakeAudioStorage())
+
+    started = client.post("/api/v1/messages/new", json={"student_id": student.id, "body": "Hi"}, headers=teacher_headers)
+    conversation_id = started.json()["conversation_id"]
+
+    resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/image",
+        files={"file": ("photo.jpg", _REAL_JPEG_BYTES, "image/jpeg")},
+        headers=student_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["kind"] == "image"
+    assert body["media_url"]
+    assert body["media_url"].startswith("https://cdn.example/")
+
+    # The teacher, reading the thread, gets a freshly-signed URL for the same
+    # asset - never a raw/stored public_id, never a 403 on their own private
+    # conversation.
+    thread = client.get(f"/api/v1/messages/conversations/{conversation_id}", headers=teacher_headers).json()
+    image_message = next(m for m in thread["items"] if m["kind"] == "image")
+    assert image_message["media_url"]
+    assert image_message["is_mine"] is False
+
+    # The conversation preview never leaks raw media content as text.
+    inbox = client.get("/api/v1/messages/conversations", headers=teacher_headers).json()
+    assert inbox["items"][0]["last_message_preview"] == "📷 Photo"
+
+
+async def test_image_upload_rejects_a_file_that_is_not_actually_an_image(client):
+    admin, admin_headers = await _login(client, "msg-badimg-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "msg-badimg-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "msg-badimg-student@example.com", Role.STUDENT, created_by_id=teacher.id)
+    fake_image = FakeImageStorage()
+    _override_messaging_storage(fake_image, FakeAudioStorage())
+
+    started = client.post("/api/v1/messages/new", json={"student_id": student.id, "body": "Hi"}, headers=teacher_headers)
+    conversation_id = started.json()["conversation_id"]
+
+    # Claims to be a JPEG (Content-Type), but the actual bytes are not a real
+    # image - the magic-number sniff must catch this before storage is ever
+    # touched, not just trust the client's claimed type.
+    resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/image",
+        files={"file": ("photo.jpg", b"not a real image, just text pretending to be one", "image/jpeg")},
+        headers=student_headers,
+    )
+    assert resp.status_code == 422, resp.text
+    assert fake_image.upload_calls == []  # never even attempted
+
+
+async def test_a_student_can_send_a_voice_message_and_the_teacher_can_play_it(client):
+    admin, admin_headers = await _login(client, "msg-voice-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "msg-voice-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "msg-voice-student@example.com", Role.STUDENT, created_by_id=teacher.id)
+    _override_messaging_storage(FakeImageStorage(), FakeAudioStorage(durations=[12.0]))
+
+    started = client.post("/api/v1/messages/new", json={"student_id": student.id, "body": "Hi"}, headers=teacher_headers)
+    conversation_id = started.json()["conversation_id"]
+
+    resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/audio",
+        files={"file": ("voice.webm", b"fake-audio-bytes", "audio/webm")},
+        headers=student_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["kind"] == "audio"
+    assert body["media_url"]
+    assert body["media_duration_seconds"] == 12.0
+
+    thread = client.get(f"/api/v1/messages/conversations/{conversation_id}", headers=teacher_headers).json()
+    voice_message = next(m for m in thread["items"] if m["kind"] == "audio")
+    assert voice_message["media_duration_seconds"] == 12.0
+    assert voice_message["media_url"]
+
+    inbox = client.get("/api/v1/messages/conversations", headers=teacher_headers).json()
+    assert inbox["items"][0]["last_message_preview"] == "🎤 Voice message"
+
+
+async def test_a_voice_message_longer_than_the_limit_is_rejected_and_the_orphan_asset_is_deleted(client):
+    admin, admin_headers = await _login(client, "msg-longvoice-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "msg-longvoice-teacher@example.com", Role.TEACHER)
+    student, student_headers = await _login(client, "msg-longvoice-student@example.com", Role.STUDENT, created_by_id=teacher.id)
+    fake_audio = FakeAudioStorage(durations=[90.0])  # over the 60s cap
+    _override_messaging_storage(FakeImageStorage(), fake_audio)
+
+    started = client.post("/api/v1/messages/new", json={"student_id": student.id, "body": "Hi"}, headers=teacher_headers)
+    conversation_id = started.json()["conversation_id"]
+
+    resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/audio",
+        files={"file": ("voice.webm", b"fake-audio-bytes", "audio/webm")},
+        headers=student_headers,
+    )
+    assert resp.status_code == 422, resp.text
+    assert fake_audio.public_ids == fake_audio.deleted_public_ids  # the uploaded-but-too-long asset was cleaned up
+
+    # Rejected upload never became a real message in the thread.
+    thread = client.get(f"/api/v1/messages/conversations/{conversation_id}", headers=teacher_headers).json()
+    assert len(thread["items"]) == 1  # only the original "Hi" text message
+
+
+async def test_a_student_cannot_attach_media_to_another_students_conversation(client):
+    admin, admin_headers = await _login(client, "msg-mediaisolation-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "msg-mediaisolation-teacher@example.com", Role.TEACHER)
+    student_a, _ = await _login(client, "msg-mediaisolation-a@example.com", Role.STUDENT, created_by_id=teacher.id)
+    student_b, student_b_headers = await _login(client, "msg-mediaisolation-b@example.com", Role.STUDENT, created_by_id=teacher.id)
+    fake_image = FakeImageStorage()
+    _override_messaging_storage(fake_image, FakeAudioStorage())
+
+    started = client.post("/api/v1/messages/new", json={"student_id": student_a.id, "body": "Hi A"}, headers=teacher_headers)
+    conversation_id = started.json()["conversation_id"]
+
+    resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/image",
+        files={"file": ("photo.jpg", _REAL_JPEG_BYTES, "image/jpeg")},
+        headers=student_b_headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert fake_image.upload_calls == []  # never reaches storage for an unauthorized conversation
+
+
+async def test_teachers_may_also_send_image_and_voice_attachments(client):
+    """Nothing in the existing permissions model restricts media to
+    students only - a Teacher/Admin can attach the same way."""
+    admin, admin_headers = await _login(client, "msg-teachermedia-admin@example.com", Role.ADMINISTRATOR)
+    teacher, teacher_headers = await _login(client, "msg-teachermedia-teacher@example.com", Role.TEACHER)
+    student, _ = await _login(client, "msg-teachermedia-student@example.com", Role.STUDENT, created_by_id=teacher.id)
+    _override_messaging_storage(FakeImageStorage(), FakeAudioStorage(durations=[5.0]))
+
+    started = client.post("/api/v1/messages/new", json={"student_id": student.id, "body": "Hi"}, headers=teacher_headers)
+    conversation_id = started.json()["conversation_id"]
+
+    image_resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/image",
+        files={"file": ("photo.jpg", _REAL_JPEG_BYTES, "image/jpeg")},
+        headers=teacher_headers,
+    )
+    assert image_resp.status_code == 201, image_resp.text
+
+    audio_resp = client.post(
+        f"/api/v1/messages/conversations/{conversation_id}/audio",
+        files={"file": ("voice.webm", b"fake-audio-bytes", "audio/webm")},
+        headers=teacher_headers,
+    )
+    assert audio_resp.status_code == 201, audio_resp.text

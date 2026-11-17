@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from app.models.message import AnnouncementScope
+from app.models.message import AnnouncementScope, MessageKind
 from app.models.user import Role
 from app.schema.base import BaseSchema
 from app.schema.limits import MAX_PROMPT_LENGTH
@@ -43,7 +43,13 @@ class MessagePublic(BaseSchema):
     sender_id: str
     sender_role: Role
     sender_name: Optional[str] = None
+    kind: MessageKind = MessageKind.TEXT
     body: str
+    # IMAGE/AUDIO only - a freshly signed delivery URL (see
+    # `MessagingService.media_url_for`), never a stored/raw public_id.
+    media_url: Optional[str] = None
+    # AUDIO only.
+    media_duration_seconds: Optional[float] = None
     read_at: Optional[datetime] = None
     announcement_id: Optional[str] = None
     is_mine: bool = False

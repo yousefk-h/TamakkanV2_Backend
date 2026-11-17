@@ -69,14 +69,6 @@ VOICE_AGENT_TRANSCRIPT_SOURCE = "voice-agent"
 # enough to stay well under the voice agent's prompt budget alongside the
 # lesson prompt it already carries.
 HANDOFF_CONTEXT_MAX_TURNS = 8
-# A genuine Practice with Mariam checkpoint attempt needs more than reaching
-# `ENDED`: a student who connects and immediately hits "end call" (or whose
-# agent hangs up before a word is exchanged) reaches `ENDED` in well under a
-# second with an empty/one-sided transcript. 12s is short enough not to
-# penalize a real, fast exchange (opening line + one short student reply) but
-# long enough to exclude that near-instant connect-then-hangup case. See
-# `is_checkpoint_practice_completed`.
-MIN_CHECKPOINT_PRACTICE_SECONDS = 12.0
 
 
 def _as_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -87,26 +79,6 @@ def _as_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
 
 
 OPEN_STATES = {SessionState.CONNECTING, SessionState.CONNECTED, SessionState.PAUSED, SessionState.DISCONNECTED}
-
-
-def is_checkpoint_practice_completed(session: LiveSession) -> bool:
-    """Whether `session` is a genuinely completed Practice with Mariam
-    checkpoint attempt - stronger than the bare `state == ENDED` check (see
-    `get_checkpoint_session_status`). On top of reaching `ENDED`, requires an
-    actual back-and-forth (at least one `transcript_history` turn from each
-    speaker, not just Mariam's opening line or an empty transcript) and a
-    minimum session duration (`MIN_CHECKPOINT_PRACTICE_SECONDS`). A missing
-    `ended_at` is treated as not-completed rather than raising."""
-    if session.state != SessionState.ENDED or session.ended_at is None:
-        return False
-    has_student_turn = any(turn.speaker == "student" for turn in session.transcript_history)
-    has_mariam_turn = any(turn.speaker == "mariam" for turn in session.transcript_history)
-    if not (has_student_turn and has_mariam_turn):
-        return False
-    started_at = _as_naive_utc(session.started_at)
-    ended_at = _as_naive_utc(session.ended_at)
-    duration_seconds = (ended_at - started_at).total_seconds()
-    return duration_seconds >= MIN_CHECKPOINT_PRACTICE_SECONDS
 
 
 def report_schedule_decision(result: "MarkEndedResult") -> tuple[bool, str]:
@@ -1010,17 +982,68 @@ class LiveSessionService:
         )
         return "\n\n".join(blocks)
 
+    def _is_meaningful_practice_completion(self, session: LiveSession) -> bool:
+        """A Practice with Mariam checkpoint must never unlock just because a
+        `LiveSession` reached `ENDED`, and - corrected per explicit owner
+        feedback - a short elapsed-time threshold (e.g. "12 seconds, one
+        turn each") is not good enough either: a student who exchanges one
+        real turn each and then manually ends at 15 seconds of a
+        teacher-configured 2-minute checkpoint must NOT unlock it just
+        because that crossed some fixed number picked by this code, not by
+        the teacher.
+
+        This codebase has no server/agent-side signal that judges whether the
+        teacher's specific `conversation_goal` was actually fulfilled - the
+        LiveKit Agents SDK's own `CloseReason` (`USER_INITIATED`,
+        `PARTICIPANT_DISCONNECTED`, `TASK_COMPLETED`, `JOB_SHUTDOWN`) are all
+        collapsed to the identical `EndReason.USER_ENDED` by
+        `livekit_agent/agent.py` - `TASK_COMPLETED` is the SDK's own generic
+        "the agent task loop returned" event, not a judgment that the
+        teacher's goal was met, and there is no function-tool or other
+        mechanism anywhere in this pipeline by which the agent (or anything
+        else) reports "the practice goal was achieved". Inventing a semantic
+        reading of `TASK_COMPLETED` (or of transcript content/length) as
+        "goal fulfilled" would be exactly the fabricated success condition
+        the owner asked this code NOT to invent.
+
+        The one reason value that IS a trustworthy, non-fabricated,
+        non-student-spoofable signal of real completion is
+        `EndReason.MAX_DURATION` - set only by the `livekit_agent` worker's
+        own server-side `_enforce_max_duration` timer (never by a browser;
+        `mark-ended` is internal-agent-only, see `require_internal_agent`),
+        fired only once the session has actually run for the FULL duration
+        `start_session` granted it - and that granted duration is already
+        exactly `min(checkpoint.session_duration_minutes, the student's
+        remaining per-topic session-minute budget)` (see `start_session`
+        above), so this one check already respects both the teacher's
+        configured length and the student's remaining budget without
+        needing to re-derive or re-check either here. A genuine two-sided
+        transcript is still required on top of that, so a session the
+        student left silently connected and muted for the full window still
+        doesn't count as practice. Early manual/idle/connection-failure
+        endings - at 15 seconds or at 100 seconds of a 120-second window -
+        are correctly never completions by this rule, by design: this
+        infrastructure cannot reliably recognize early goal completion, so
+        it does not pretend to."""
+        if session.state != SessionState.ENDED:
+            return False
+        if session.end_reason != EndReason.MAX_DURATION:
+            return False
+        speakers = {turn.speaker for turn in session.transcript_history}
+        return "student" in speakers and "mariam" in speakers
+
     async def get_checkpoint_session_status(self, student: User, checkpoint_id: str) -> "CheckpointSessionStatus":
         """Whether THIS student has a genuinely completed Practice with Mariam
-        session for this one checkpoint (see `is_checkpoint_practice_completed`
-        - reaching `ENDED` alone is not enough) - the lightweight completion
-        signal a Practice with Mariam checkpoint needs instead of an exercise
-        attempt (see `app.api.v1.topics.get_checkpoint_session_status`).
-        Scoped to the requesting student only - another student's sessions
-        for the same checkpoint are never visible here."""
+        session for this one checkpoint - the lightweight completion signal a
+        Practice with Mariam checkpoint needs instead of an exercise attempt
+        (see `app.api.v1.topics.get_checkpoint_session_status`). Scoped to the
+        requesting student only - another student's sessions for the same
+        checkpoint are never visible here. `completed` is `True` only when
+        `_is_meaningful_practice_completion` says so for at least one session -
+        a bare `ENDED` state is not enough, see that method's own doc."""
         sessions = await self.session_repository.get_for_student_and_checkpoint(student.id, checkpoint_id)
         latest = sessions[0] if sessions else None
-        completed = any(is_checkpoint_practice_completed(session) for session in sessions)
+        completed = any(self._is_meaningful_practice_completion(session) for session in sessions)
         return CheckpointSessionStatus(
             completed=completed,
             latest_session_id=latest.id if latest else None,

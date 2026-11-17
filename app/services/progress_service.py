@@ -20,7 +20,7 @@ from app.core.challenge import CHALLENGE_TOTAL_DAYS, END_OF_WEEK_CHECKIN_DAYS
 from app.models.calendar_template import CalendarTemplate, TemplateKind
 from app.models.cohort import Cohort
 from app.models.enrollment import Enrollment, EnrollmentStatus
-from app.models.program import Program
+from app.models.program import Program, UnlockPolicy
 from app.models.live_session import LiveSession, SessionState
 from app.models.recording_submission import RecordingSubmission
 from app.models.topic_content import TopicContent
@@ -215,6 +215,68 @@ def _build_schedule(
     return ChallengeCalendar(lesson_days=lesson_days, pending_count=pending_count, total_days=template.duration_days, rest_days=template.rest_days)
 
 
+async def _build_completion_schedule(
+    template: Optional[CalendarTemplate],
+    student: User,
+    enrollment: Optional[Enrollment],
+    program_id: Optional[str],
+    program_level_id: Optional[str],
+    legacy_attributable: bool,
+) -> ChallengeCalendar:
+    """The COMPLETION-policy counterpart to `_build_schedule`. Never reads a
+    calendar date - `template.days[].day` is treated purely as an ordering
+    key, and `template.duration_days` plays no role at all, which is what
+    lets a self-paced program (no fixed length) work without a manufactured
+    total. A day-slot with several `topic_ids` is walked as that many
+    INDEPENDENT nodes, in list order - never bundled as one unit - so the
+    first incomplete node locks everything after it, not everything after
+    its calendar day. `TopicCompletionService` (imported locally to avoid a
+    module cycle: it depends on `exercise_attempt_service`, which depends on
+    `topic_content_service`, which depends on this module) is the one real
+    per-topic-type completion check; this never falls back to
+    `_had_a_real_conversation`, which is too weak to gate a real unlock."""
+    from app.services.topic_completion_service import get_topic_completion_service
+
+    if template is None:
+        return ChallengeCalendar(lesson_days=[], pending_count=0, has_template=False, total_days=0, unlock_policy=UnlockPolicy.COMPLETION)
+    if not template.days:
+        return ChallengeCalendar(
+            lesson_days=[], pending_count=0, has_template=True, total_days=0,
+            rest_days=template.rest_days, unlock_policy=UnlockPolicy.COMPLETION,
+        )
+
+    ordered_entries = [entry for entry in sorted(template.days, key=lambda e: e.day) if entry.day not in template.rest_days]
+    all_topic_ids = [tid for entry in ordered_entries for tid in entry.topic_ids]
+    topics_by_id = {t.id: t for t in await TopicContent.find({"_id": {"$in": all_topic_ids}, "is_deleted": False}).to_list()}
+
+    completion_service = get_topic_completion_service()
+    lesson_days: list[LessonDaySlot] = []
+    unlocked = True
+    for entry in ordered_entries:
+        slots: list[TopicSlot] = []
+        for topic_id in entry.topic_ids:
+            topic = topics_by_id.get(topic_id)
+            if not unlocked or topic is None:
+                slots.append(TopicSlot(topic_id=topic_id, state=LessonDayState.LOCKED))
+                continue
+            done = await completion_service.is_topic_completed(
+                student, topic,
+                enrollment=enrollment, program_id=program_id,
+                program_level_id=program_level_id, legacy_attributable=legacy_attributable,
+            )
+            if done:
+                slots.append(TopicSlot(topic_id=topic_id, state=LessonDayState.DONE))
+            else:
+                slots.append(TopicSlot(topic_id=topic_id, state=LessonDayState.CURRENT))
+                unlocked = False
+        lesson_days.append(LessonDaySlot(day=entry.day, topics=slots))
+
+    return ChallengeCalendar(
+        lesson_days=lesson_days, pending_count=0, has_template=True,
+        total_days=len(all_topic_ids), rest_days=template.rest_days, unlock_policy=UnlockPolicy.COMPLETION,
+    )
+
+
 _STATUS_PRECEDENCE = {LessonDayState.LOCKED: 0, LessonDayState.MISSED: 1, LessonDayState.CURRENT: 2, LessonDayState.DONE: 3}
 
 
@@ -349,9 +411,25 @@ class ProgressService:
 
         template = await self._resolve_template(student)
         effective_start = await self._effective_program_start_date(student)
-        total_days = template.duration_days if template else CHALLENGE_TOTAL_DAYS
-        challenge_day = _program_today(effective_start, total_days)
-        milestones = [ChallengeMilestone(day=d, reached=challenge_day >= d) for d in CHALLENGE_MILESTONE_DAYS]
+        program = await self._resolve_program_for_template(template)
+        unlock_policy = program.unlock_policy if program is not None else UnlockPolicy.SCHEDULE
+        if unlock_policy == UnlockPolicy.COMPLETION:
+            enrollment, program_id, program_level_id, legacy_attributable = await self._completion_identity(student)
+            completion_schedule = await _build_completion_schedule(
+                template, student, enrollment, program_id, program_level_id, legacy_attributable
+            )
+            total_days = completion_schedule.total_days
+            challenge_day = sum(
+                1 for day in completion_schedule.lesson_days for slot in day.topics if slot.state == LessonDayState.DONE
+            ) + (1 if any(slot.state == LessonDayState.CURRENT for day in completion_schedule.lesson_days for slot in day.topics) else 0)
+        else:
+            total_days = template.duration_days if template else CHALLENGE_TOTAL_DAYS
+            challenge_day = _program_today(effective_start, total_days)
+        # Milestones (days 10/20/30) are a SCHEDULE-only, calendar-day concept - a COMPLETION-policy program's
+        # `challenge_day` is a node count, not a date, so milestone thresholds would be a meaningless coincidence.
+        milestones = [
+            ChallengeMilestone(day=d, reached=challenge_day >= d) for d in CHALLENGE_MILESTONE_DAYS
+        ] if unlock_policy == UnlockPolicy.SCHEDULE else []
         _program_id, program_name = await self._resolve_program_context(student)
         has_multiple_enrollments = await self._has_multiple_active_enrollments(student)
 
@@ -368,6 +446,7 @@ class ProgressService:
             program_start_date=effective_start.date() if effective_start else None,
             program_name=program_name,
             has_multiple_enrollments=has_multiple_enrollments,
+            unlock_policy=unlock_policy,
             last_7_days_active=last_7_days_active,
             last_7_days_dates=[today - timedelta(days=offset) for offset in range(6, -1, -1)],
             badges=badges,
@@ -375,19 +454,95 @@ class ProgressService:
         )
 
     async def _resolve_template(self, student: User) -> Optional[CalendarTemplate]:
-        """The calendar this student actually follows. Tries the legacy
-        `plan`/`program_id`/`assigned_level` path first (zero behavior change
-        for every account that predates Cohorts/Enrollments); a student
-        enrolled ONLY through a Cohort - no `assign_plan` call ever made for
-        them - falls back to their single active Enrollment's effective
-        schedule, the same canonical resolution `EnrollmentService`/"My
-        Learning" already uses. See `_resolve_enrollment_fallback` for why
-        this never guesses among several active enrollments."""
-        legacy = await self._resolve_legacy_template(student)
-        if legacy is not None:
-            return legacy
-        fallback = await self._resolve_enrollment_fallback(student)
-        return fallback[0] if fallback else None
+        """The calendar this student actually follows. Tries the *specific*
+        legacy match first (an explicit `program_id`+level that still
+        resolves, or a Pro student's explicitly admin-assigned template -
+        zero behavior change for any account whose legacy fields genuinely
+        still point somewhere real). If that doesn't resolve, the student's
+        own single active Enrollment - the same canonical resolution
+        `EnrollmentService`/"My Learning" already uses - is tried next,
+        BEFORE the broad last-resort "any Standard template this admin ever
+        activated for this level" guess: that guess has no connection to any
+        specific Program/Cohort the student is actually in, and was found to
+        silently out-rank a real, correct Enrollment whenever a stale/orphaned
+        legacy `program_id` (e.g. pointing at a deleted Program) still let the
+        broad guess fire - producing a real, confirmed bug where Home/Learning
+        Journey showed a day count and milestones against the WRONG template
+        while "My Learning" (which never consults this legacy path at all)
+        correctly showed the student's real Enrollment-backed schedule. Only
+        when neither a specific legacy match nor a real Enrollment resolves
+        does this fall through to the full legacy resolution (including that
+        broad guess) - unchanged for any account that predates Cohorts/
+        Enrollments entirely and has none. See `_resolve_enrollment_fallback`
+        for why this never guesses among several active enrollments."""
+        specific = await self._resolve_legacy_specific_template(student)
+        if specific is not None:
+            return specific
+        enrollment_fallback = await self._resolve_enrollment_fallback(student)
+        if enrollment_fallback is not None:
+            return enrollment_fallback[0]
+        return await self._resolve_legacy_template(student)
+
+    async def _resolve_legacy_specific_template(self, student: User) -> Optional[CalendarTemplate]:
+        """The non-guessed half of `_resolve_legacy_template`: an explicit
+        `program_id`(+level) match for a Standard student, or a Pro student's
+        explicitly admin-assigned template. Deliberately excludes the broad
+        `get_active_standard(created_by_id, level)` last-resort guess at the
+        end of `_resolve_legacy_template` - see `_resolve_template` for why
+        that guess must never outrank a real Enrollment."""
+        if student.plan == PlanType.STANDARD:
+            if student.assigned_level is None or not student.program_id:
+                return None
+            if student.program_level_id:
+                program_level_template = await self.calendar_template_repository.get_active_standard_for_program_level(
+                    student.program_id, student.program_level_id
+                )
+                if program_level_template is not None:
+                    return program_level_template
+            return await self.calendar_template_repository.get_active_standard_for_program(
+                student.program_id, student.assigned_level
+            )
+        if student.plan == PlanType.PRO:
+            if student.assigned_plan_template_id is None:
+                return None
+            return await self.calendar_template_repository.get_by_id(student.assigned_plan_template_id)
+        return None
+
+    async def _resolve_program_for_template(self, template: Optional[CalendarTemplate]) -> Optional[Program]:
+        """Which Program (if any) owns the resolved template - the one place
+        that decides SCHEDULE vs COMPLETION gating for a given student's
+        single-calendar view. `None` for a template with no `program_id`
+        (shouldn't happen for a real Standard/Cohort template, but a
+        `CUSTOM` Pro template has none) - treated as SCHEDULE, unchanged."""
+        if template is None or template.program_id is None:
+            return None
+        return await Program.find_one({"_id": template.program_id, "is_deleted": False})
+
+    async def _completion_identity(self, student: User) -> tuple[Optional[Enrollment], Optional[str], Optional[str], bool]:
+        """(enrollment, program_id, program_level_id, legacy_attributable)
+        for COMPLETION-policy exercise/session filtering - mirrors
+        `_resolve_template`'s own priority (a specific legacy match first,
+        then the student's one real Enrollment) so the identity used to
+        check completion always matches whichever template actually
+        resolved. Duplicates `EnrollmentService._with_legacy_attributable`'s
+        sibling check rather than calling it, to keep this module's only
+        dependency on enrollment_service the existing local-import pattern
+        used elsewhere here."""
+        specific = await self._resolve_legacy_specific_template(student)
+        if specific is not None:
+            return None, student.program_id, student.program_level_id, True
+        active = await Enrollment.find({
+            "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
+        }).to_list()
+        if len(active) == 1:
+            enrollment = active[0]
+            sibling_count = await Enrollment.find({
+                "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
+                "program_id": enrollment.program_id, "program_level_id": enrollment.program_level_id,
+                "_id": {"$ne": enrollment.id},
+            }).count()
+            return enrollment, enrollment.program_id, enrollment.program_level_id, sibling_count == 0
+        return None, student.program_id, student.program_level_id, True
 
     async def _resolve_enrollment_fallback(self, student: User) -> Optional[tuple[CalendarTemplate, datetime]]:
         """(template, anchor date) from the student's Enrollment, for a
@@ -415,12 +570,30 @@ class ProgressService:
 
     async def _resolve_program_context(self, student: User) -> tuple[Optional[str], Optional[str]]:
         """(program_id, program_name) for whichever Program this student's
-        single calendar actually belongs to - legacy `program_id` first, then
-        the same single-active-Enrollment fallback `_resolve_template` uses.
-        `program_id` is `None` for a student with 0 or 2+ active enrollments
-        and no legacy program either (see `has_multiple_enrollments` on
-        `StudentProgress` for how the frontend tells those two apart)."""
-        program_id = student.program_id
+        single calendar actually belongs to - mirrors `_resolve_template`'s
+        own priority exactly (a specific legacy match first, then the
+        student's real Enrollment, only then the legacy `program_id` as a
+        last resort), so `program_name` never disagrees with which template
+        `_resolve_template` actually picked. `program_id` is `None` for a
+        student with 0 or 2+ active enrollments and no legacy program either
+        (see `has_multiple_enrollments` on `StudentProgress` for how the
+        frontend tells those two apart)."""
+        specific = await self._resolve_legacy_specific_template(student)
+        if specific is not None and student.program_id is not None:
+            program = await Program.find_one({"_id": student.program_id, "is_deleted": False})
+            return student.program_id, program.name if program else None
+        enrollment_fallback = await self._resolve_enrollment_fallback(student)
+        if enrollment_fallback is not None:
+            return await self._program_context_for_enrollment(student)
+        # Neither a specific match nor a real Enrollment resolved - `_resolve_template` itself still falls through
+        # to the broad last-resort guess here, so this must use THAT exact template's own `program_id` (when it
+        # has one) rather than re-deriving `program_id` independently - otherwise `program_name` can land `None`
+        # even though `_resolve_template`/the topic list are using a real, named Program's template (the gap that
+        # produced a genuine "day count but no name" inconsistency for a 0-Enrollment account whose broad-guess
+        # template simply has no authored days yet - a legitimate "valid program, incomplete content" case, not an
+        # invalid reference).
+        broad_guess = await self._resolve_legacy_template(student)
+        program_id = (broad_guess.program_id if broad_guess else None) or student.program_id
         if program_id is None:
             active = await Enrollment.find({
                 "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
@@ -432,6 +605,18 @@ class ProgressService:
         program = await Program.find_one({"_id": program_id, "is_deleted": False})
         return program_id, program.name if program else None
 
+    async def _program_context_for_enrollment(self, student: User) -> tuple[Optional[str], Optional[str]]:
+        """(program_id, program_name) for the student's own single active Enrollment - only ever called once
+        `_resolve_enrollment_fallback` already confirmed exactly one exists and it resolves to a real template."""
+        active = await Enrollment.find({
+            "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
+        }).to_list()
+        if len(active) != 1:
+            return None, None
+        program_id = active[0].program_id
+        program = await Program.find_one({"_id": program_id, "is_deleted": False})
+        return program_id, program.name if program else None
+
     async def _has_multiple_active_enrollments(self, student: User) -> bool:
         count = await Enrollment.find({
             "student_id": student.id, "is_deleted": False, "status": EnrollmentStatus.ACTIVE.value,
@@ -439,14 +624,18 @@ class ProgressService:
         return count > 1
 
     async def _effective_program_start_date(self, student: User) -> Optional[datetime]:
-        """`student.program_start_date` when set (legacy path, unchanged);
-        otherwise the single-enrollment fallback's anchor date, so the
-        Challenge day/date and the day-by-day calendar agree with whatever
-        template `_resolve_template` actually picked."""
-        if student.program_start_date is not None:
+        """The anchor date for whichever template `_resolve_template` actually picked - same priority order:
+        `student.program_start_date` only when a *specific* legacy match resolved (so a stale/orphaned legacy
+        `program_id` can never anchor against a date that belongs to a totally different, no-longer-existent
+        program); otherwise the real Enrollment's own anchor date; `student.program_start_date` again as the
+        final fallback, unchanged, for an account with neither a specific legacy match nor any Enrollment."""
+        specific = await self._resolve_legacy_specific_template(student)
+        if specific is not None:
             return student.program_start_date
         fallback = await self._resolve_enrollment_fallback(student)
-        return fallback[1] if fallback else None
+        if fallback is not None:
+            return fallback[1]
+        return student.program_start_date
 
     async def _resolve_legacy_template(self, student: User) -> Optional[CalendarTemplate]:
         """The calendar this student actually follows: a Standard student
@@ -535,6 +724,10 @@ class ProgressService:
         nothing to schedule at all.
         """
         template = await self._resolve_template(student)
+        program = await self._resolve_program_for_template(template)
+        if program is not None and program.unlock_policy == UnlockPolicy.COMPLETION:
+            enrollment, program_id, program_level_id, legacy_attributable = await self._completion_identity(student)
+            return await _build_completion_schedule(template, student, enrollment, program_id, program_level_id, legacy_attributable)
         sessions = _for_current_enrollment(student, await self.session_repository.get_all_for_student(student.id))
         effective_start = await self._effective_program_start_date(student)
         return _build_schedule(template, sessions, effective_start)
@@ -565,6 +758,12 @@ class ProgressService:
         template = await self.calendar_template_repository.get_effective_schedule(
             context.program_id, context.program_level_id, context.cohort_id
         )
+        program = await Program.find_one({"_id": context.program_id, "is_deleted": False}) if context.program_id else None
+        if program is not None and program.unlock_policy == UnlockPolicy.COMPLETION:
+            schedule = await _build_completion_schedule(
+                template, student, context.enrollment, context.program_id, context.program_level_id, context.legacy_attributable
+            )
+            return resolve_topic_statuses(schedule)
         all_sessions = await self.session_repository.get_all_for_student(student.id)
         sessions = [
             s for s in all_sessions

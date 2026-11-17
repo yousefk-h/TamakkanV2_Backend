@@ -20,7 +20,7 @@ from app.core.exceptions import ForbiddenException, NotFoundException, Unprocess
 from app.models.calendar_template import CalendarTemplate
 from app.models.cohort import Cohort
 from app.models.enrollment import Enrollment, EnrollmentStatus
-from app.models.program import Program
+from app.models.program import Program, UnlockPolicy
 from app.models.topic_content import TopicContent
 from app.models.user import User
 from app.repositories.calendar_template_repository import CalendarTemplateRepository
@@ -152,6 +152,8 @@ class EnrollmentService:
 
         context = await self._with_legacy_attributable(enrollment)
         topic_states = await get_progress_service().get_topic_statuses_for_context(student, context)
+        program = await Program.find_one({"_id": enrollment.program_id, "is_deleted": False})
+        unlock_policy = program.unlock_policy if program is not None else UnlockPolicy.SCHEDULE
         topic_ids = {topic_id for entry in template.days for topic_id in entry.topic_ids}
         topic_titles = {
             topic.id: topic.title
@@ -176,6 +178,7 @@ class EnrollmentService:
             rest_days=template.rest_days,
             current_day=current_day,
             days=days,
+            unlock_policy=unlock_policy,
         )
 
     @staticmethod

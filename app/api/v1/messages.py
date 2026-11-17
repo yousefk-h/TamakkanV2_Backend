@@ -4,7 +4,7 @@ delivery rules - every recipient list is resolved server-side from the
 caller's own existing reach, never from a client-supplied id list.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 
 from app.core.security import get_current_user
 from app.models.message import AnnouncementScope
@@ -57,6 +57,31 @@ async def reply_to_conversation(
     how a Student responds to a Teacher/Admin; a Student can never use this
     to start a conversation with someone new (see `/messages/new`)."""
     return await service.reply(caller, conversation_id, body.body)
+
+
+@router.post("/messages/conversations/{conversation_id}/image", response_model=MessagePublic, status_code=201)
+async def send_image_message(
+    conversation_id: str, file: UploadFile = File(...),
+    caller: User = Depends(get_current_user), service: MessagingService = Depends(get_messaging_service),
+) -> MessagePublic:
+    """Either participant may attach an image to an existing conversation -
+    same authorization boundary as `reply`. The actual bytes are validated
+    server-side (real magic-number sniff, then Cloudinary's own decode),
+    never just the browser's claimed Content-Type."""
+    data = await file.read()
+    return await service.send_image_message(caller, conversation_id, data, file.content_type or "")
+
+
+@router.post("/messages/conversations/{conversation_id}/audio", response_model=MessagePublic, status_code=201)
+async def send_voice_message(
+    conversation_id: str, file: UploadFile = File(...),
+    caller: User = Depends(get_current_user), service: MessagingService = Depends(get_messaging_service),
+) -> MessagePublic:
+    """Same authorization boundary as `reply`/the image attachment above.
+    Duration is Cloudinary's own reported value, checked after upload - see
+    `MessagingService.send_voice_message`'s own doc for why."""
+    data = await file.read()
+    return await service.send_voice_message(caller, conversation_id, data, file.content_type or "")
 
 
 @router.post("/messages/new", response_model=MessagePublic, status_code=201)

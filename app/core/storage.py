@@ -202,6 +202,62 @@ def get_image_storage() -> ImageStorage:
     return CloudinaryImageStorage()
 
 
+# Private chat image attachments (Messages). Unlike a lesson thumbnail, this
+# is private 1:1 content between a Student and a Teacher/Admin - delivery
+# must be `authenticated` (signed), the same reasoning as `AudioStorage`
+# above, not the plain public `upload` type `CloudinaryImageStorage` uses.
+class PrivateImageStorage(Protocol):
+    async def upload(self, file_bytes: bytes, public_id: str) -> ImageUploadResult: ...
+    async def delete(self, public_id: str) -> None: ...
+
+    def signed_url(self, public_id: str) -> str: ...
+
+
+class CloudinaryPrivateImageStorage:
+    async def upload(self, file_bytes: bytes, public_id: str) -> ImageUploadResult:
+        _ensure_configured()
+        try:
+            result = await run_in_threadpool(
+                cloudinary.uploader.upload,
+                file_bytes,
+                public_id=public_id,
+                resource_type=IMAGE_RESOURCE_TYPE,
+                type=DELIVERY_TYPE,
+            )
+            return ImageUploadResult(public_id=result["public_id"], secure_url=result["secure_url"])
+        except Exception as exc:
+            logger.warning("Cloudinary private image upload failed for public_id={}: {}", public_id, exc)
+            raise UploadFailedError(str(exc)) from exc
+
+    async def delete(self, public_id: str) -> None:
+        _ensure_configured()
+        try:
+            await run_in_threadpool(
+                cloudinary.uploader.destroy,
+                public_id,
+                resource_type=IMAGE_RESOURCE_TYPE,
+                type=DELIVERY_TYPE,
+            )
+        except Exception as exc:
+            logger.warning("Cloudinary private image delete failed for public_id={}: {}", public_id, exc)
+            raise UploadFailedError(str(exc)) from exc
+
+    def signed_url(self, public_id: str) -> str:
+        _ensure_configured()
+        url, _options = cloudinary.utils.cloudinary_url(
+            public_id,
+            resource_type=IMAGE_RESOURCE_TYPE,
+            type=DELIVERY_TYPE,
+            sign_url=True,
+            secure=True,
+        )
+        return url
+
+
+def get_private_image_storage() -> PrivateImageStorage:
+    return CloudinaryPrivateImageStorage()
+
+
 class CloudinaryLessonAudioStorage:
     """Public teacher-authored listening audio, separate from private student recordings."""
 

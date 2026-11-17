@@ -2,7 +2,7 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.models.program import Program, ProgramLevelDefinition
+from app.models.program import Program, ProgramLevelDefinition, UnlockPolicy
 from app.models.topic_content import Level
 from app.schema.base import BaseSchema
 
@@ -15,6 +15,7 @@ class ProgramWrite(BaseModel):
     base_levels: list[Level] = Field(min_length=1, max_length=3)
     level_profile_ids: list[str] = Field(default_factory=list, max_length=50)
     levels: list[ProgramLevelDefinition] = Field(default_factory=list, max_length=50)
+    unlock_policy: UnlockPolicy = UnlockPolicy.SCHEDULE
 
     @field_validator("code")
     @classmethod
@@ -35,6 +36,7 @@ class ProgramPublic(BaseSchema):
     levels: list[ProgramLevelDefinition]
     created_by_id: str
     is_active: bool
+    unlock_policy: UnlockPolicy
 
     @classmethod
     def from_program(cls, item: Program) -> "ProgramPublic":
