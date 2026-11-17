@@ -10,6 +10,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from app.models.program import UnlockPolicy
+
 
 class LessonDayState(str, Enum):
     DONE = "done"
@@ -49,3 +51,10 @@ class ChallengeCalendar(BaseModel):
     # `User.program_start_date`) still returns `True` here - every day just
     # comes back `locked`, which is its own correct signal.
     has_template: bool = True
+    # SCHEDULE (the long-standing default): `total_days`/day numbers are real
+    # calendar days anchored to `program_start_date`. COMPLETION: `day`
+    # numbers are pure ordering keys (no calendar date), `total_days` is the
+    # real count of lesson nodes in the template, and there is never a
+    # MISSED state - the frontend must label/group accordingly, never
+    # printing a manufactured calendar day for a COMPLETION-policy program.
+    unlock_policy: UnlockPolicy = UnlockPolicy.SCHEDULE

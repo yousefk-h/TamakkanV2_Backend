@@ -13,6 +13,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.models.program import UnlockPolicy
+
 
 class BadgeKey(str, Enum):
     STREAK = "streak"
@@ -62,6 +64,12 @@ class StudentProgress(BaseModel):
     # "My Learning" (which lists every enrollment separately) instead of
     # implying they have no plan at all.
     has_multiple_enrollments: bool = False
+    # SCHEDULE (default): `challenge_day`/`challenge_total_days` are real
+    # calendar days anchored to `program_start_date`. COMPLETION:
+    # `challenge_day` is how many lesson nodes are done/current and
+    # `challenge_total_days` is the real node count - neither is a calendar
+    # date, so the frontend must never print "Day N of 30" for this policy.
+    unlock_policy: UnlockPolicy = UnlockPolicy.SCHEDULE
     # Oldest to newest, always exactly 7 entries, the 7th being today - the
     # weekly dot tracker's data, not a display-ready label set (the frontend
     # already owns day-of-week formatting via the locale).

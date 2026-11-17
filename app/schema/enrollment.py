@@ -4,6 +4,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from app.models.enrollment import Enrollment, EnrollmentSource, EnrollmentStatus, LateJoinMode
+from app.models.program import UnlockPolicy
 from app.schema.base import BaseSchema
 from app.schema.challenge import LessonDayState
 
@@ -133,3 +134,8 @@ class EnrollmentSchedule(BaseModel):
     rest_days: list[int] = Field(default_factory=list)
     current_day: int = 0
     days: list[EnrollmentScheduleDay] = Field(default_factory=list)
+    # `total_days`/`current_day` above stay calendar-day-shaped either way
+    # (no logic change here - `topic_states`/`locked` are already the real,
+    # policy-aware authority). For COMPLETION the frontend must not print
+    # them as a calendar day count - see `days[].topic_states` instead.
+    unlock_policy: UnlockPolicy = UnlockPolicy.SCHEDULE
